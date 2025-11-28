@@ -5,6 +5,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGroq } from "@ai-sdk/groq";
 import { createGateway } from "ai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import {
   createOpenAICompatible,
   type OpenAICompatibleProvider,
@@ -67,6 +68,13 @@ export async function getProvidersFromConfig() {
           apiKey: config.providers["ai-gateway"].api_key,
         })
       : null,
+    google: config.providers.google
+      ? createGoogleGenerativeAI({
+          baseURL: config.providers.google.base_url,  
+          apiKey: config.providers.google.api_key!,
+          headers: config.providers.google.extra_headers,
+        })
+      : null, 
     ...Object.fromEntries(
       openaiCompatibleProviders.map((p) => [
         p,

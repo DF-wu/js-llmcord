@@ -80,6 +80,7 @@ export type Providers =
   | "anthropic"
   | "groq"
   | "ai-gateway"
+  | "google"
   | (string & {});
 
 export type DbModelMessage = {
