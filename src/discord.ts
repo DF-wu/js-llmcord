@@ -487,6 +487,7 @@ export class DiscordOperator {
         }
       : {};
 
+    // Get tools
     const tools = toolsDisabledForModel
       ? undefined
       : await this.toolManager.getTools();
@@ -730,7 +731,9 @@ export class DiscordOperator {
         const reason = await finishReason;
         let { lastMsg, responseQueue, discordMessageCreated } =
           await pusherPromise;
-        if (contentAcc.length === 0) {
+        // Only throw "No content generated" if finishReason is not "tool-calls"
+        // When model calls tools, content can be empty which is expected behavior
+        if (contentAcc.length === 0 && reason !== "tool-calls") {
           await Promise.all(
             discordMessageCreated.map((id) => msg.channel.messages.delete(id)),
           );
