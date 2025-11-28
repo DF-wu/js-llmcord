@@ -49,12 +49,15 @@ export type Config = {
   };
 };
 
-export type ProviderConfig = Record<string, string> & {
+export type ProviderConfig = Record<string, unknown> & {
   base_url: string;
   api_key?: string;
   extra_headers?: Record<string, string>;
   extra_query?: Record<string, string>;
   extra_body?: Record<string, unknown>;
+  compatibility?: {
+    patch_tool_call_index?: boolean;
+  };
 };
 
 export type ModelConfig = Record<string, unknown> & {

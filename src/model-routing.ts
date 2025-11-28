@@ -11,6 +11,7 @@ import {
   type OpenAICompatibleProvider,
 } from "@ai-sdk/openai-compatible";
 import type { Providers } from "./type";
+import { createToolCallIndexPatchedFetch } from "./tool-call-index-patch";
 
 export async function getProvidersFromConfig() {
   const config = await getConfig();
@@ -21,6 +22,7 @@ export async function getProvidersFromConfig() {
     "openrouter",
     "groq",
     "ai-gateway",
+    "google",
   ];
   const openaiCompatibleProviders = Object.keys(config.providers).filter(
     (p) => !preConfigurable.includes(p),
@@ -76,16 +78,27 @@ export async function getProvidersFromConfig() {
         })
       : null, 
     ...Object.fromEntries(
-      openaiCompatibleProviders.map((p) => [
-        p,
-        createOpenAICompatible({
-          name: p,
-          baseURL: config.providers[p]!.base_url,
-          apiKey: config.providers[p]!.api_key,
-          headers: config.providers[p]!.extra_headers,
-          queryParams: config.providers[p]!.extra_query,
-        }),
-      ]),
+      openaiCompatibleProviders.map((p) => {
+        const providerConfig = config.providers[p]!;
+        const needsToolPatch = Boolean(
+          providerConfig.compatibility?.patch_tool_call_index,
+        );
+        const fetchImpl = needsToolPatch
+          ? createToolCallIndexPatchedFetch(globalThis.fetch)
+          : undefined;
+
+        return [
+          p,
+          createOpenAICompatible({
+            name: p,
+            baseURL: providerConfig.base_url,
+            apiKey: providerConfig.api_key,
+            headers: providerConfig.extra_headers,
+            queryParams: providerConfig.extra_query,
+            fetch: fetchImpl,
+          }),
+        ];
+      }),
     ),
   } satisfies Record<Providers, unknown>;
   return providers as typeof providers &
