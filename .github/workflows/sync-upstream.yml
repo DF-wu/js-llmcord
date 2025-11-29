@@ -1,0 +1,351 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run every 3 days at 00:00 UTC
+    - cron: "0 0 */3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_OWNER: stanley2058
+  UPSTREAM_REPO: js-llmcord
+  UPSTREAM_BRANCH: main
+  LLM_MODEL: gemini-2.5-pro
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and check for updates
+        id: fetch
+        run: |
+          echo "Adding upstream remote..."
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git"
+
+          if ! git fetch upstream ${{ env.UPSTREAM_BRANCH }}; then
+            echo "❌ Failed to fetch upstream. Network issue or repository not found."
+            echo "upstream_commits=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Count new commits from upstream
+          UPSTREAM_COMMITS=$(git rev-list HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --count)
+          echo "upstream_commits=$UPSTREAM_COMMITS" >> $GITHUB_OUTPUT
+
+          if [ "$UPSTREAM_COMMITS" -eq 0 ]; then
+            echo "✅ No upstream updates found. Already up to date."
+          else
+            echo "📦 Found $UPSTREAM_COMMITS new commit(s) from upstream."
+            echo ""
+            echo "New commits:"
+            git log HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --oneline | head -10
+            
+            # Pre-collect upstream log BEFORE merge attempt (save to file)
+            git log HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --oneline | head -20 > /tmp/upstream_log.txt
+          fi
+
+      - name: Attempt merge
+        id: merge
+        if: steps.fetch.outputs.upstream_commits != '0'
+        run: |
+          echo "Attempting to merge upstream/${{ env.UPSTREAM_BRANCH }}..."
+
+          # Use || true to prevent step failure, then check result
+          git merge upstream/${{ env.UPSTREAM_BRANCH }} -m "Merge upstream ${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}" && MERGE_OK=1 || MERGE_OK=0
+
+          if [ "$MERGE_OK" -eq 1 ]; then
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            echo "✅ Merge successful!"
+          else
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            echo "❌ Merge failed due to conflicts."
+            
+            # Collect conflict info while in conflict state
+            echo "Collecting conflict information..."
+            
+            # Get conflicting files (may be empty for non-conflict failures)
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+            if [ -z "$CONFLICT_FILES" ]; then
+              # Fallback: get all files with merge conflicts markers or changed files
+              CONFLICT_FILES=$(git diff --name-only 2>/dev/null || echo "Unable to determine conflicting files")
+            fi
+            echo "$CONFLICT_FILES" > /tmp/conflict_files.txt
+            
+            # Get diff for each conflicting file
+            echo "" > /tmp/diff_content.txt
+            while IFS= read -r file; do
+              if [ -n "$file" ] && [ -f "$file" ]; then
+                echo "=== $file ===" >> /tmp/diff_content.txt
+                head -100 "$file" >> /tmp/diff_content.txt
+                echo "" >> /tmp/diff_content.txt
+              fi
+            done < /tmp/conflict_files.txt
+            
+            # If diff_content is still empty, add a note
+            if [ ! -s /tmp/diff_content.txt ]; then
+              echo "No diff content available. The merge may have failed for reasons other than file conflicts." > /tmp/diff_content.txt
+            fi
+            
+            # Abort the merge to clean up
+            git merge --abort 2>/dev/null || git reset --hard HEAD || true
+            echo "Merge aborted for cleanup."
+          fi
+
+      - name: Set conflict outputs
+        id: conflict_info
+        if: steps.fetch.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'false'
+        run: |
+          # Read from files saved in previous step (with fallback)
+          echo "conflict_files<<EOF" >> $GITHUB_OUTPUT
+          if [ -f /tmp/conflict_files.txt ]; then
+            cat /tmp/conflict_files.txt >> $GITHUB_OUTPUT
+          else
+            echo "Unable to determine conflicting files" >> $GITHUB_OUTPUT
+          fi
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "upstream_log<<EOF" >> $GITHUB_OUTPUT
+          if [ -f /tmp/upstream_log.txt ]; then
+            cat /tmp/upstream_log.txt >> $GITHUB_OUTPUT
+          else
+            echo "Unable to retrieve upstream log" >> $GITHUB_OUTPUT
+          fi
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Check for existing sync issue
+        id: check_issue
+        if: steps.fetch.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync'
+            });
+
+            const existingIssue = issues.data.find(issue => 
+              issue.title.includes('Upstream Sync Failed')
+            );
+
+            if (existingIssue) {
+              console.log(`Found existing issue #${existingIssue.number}, skipping creation.`);
+              core.setOutput('exists', 'true');
+              core.setOutput('issue_number', existingIssue.number);
+            } else {
+              console.log('No existing sync issue found.');
+              core.setOutput('exists', 'false');
+            }
+
+      - name: Generate issue content with LLM
+        id: llm_analysis
+        if: steps.fetch.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'false' && steps.check_issue.outputs.exists == 'false'
+        continue-on-error: true
+        env:
+          LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          # Check if LLM API is configured
+          if [ -z "$LLM_API_BASE" ] || [ -z "$LLM_API_KEY" ]; then
+            echo "⚠️ LLM API not configured, will use fallback template."
+            echo "llm_success=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Read conflict info from files (safer than using outputs with special chars)
+          CONFLICT_FILES=$(cat /tmp/conflict_files.txt 2>/dev/null || echo "Unknown")
+          UPSTREAM_LOG=$(cat /tmp/upstream_log.txt 2>/dev/null || echo "Unknown")
+          DIFF_CONTENT=$(cat /tmp/diff_content.txt 2>/dev/null | head -500 || echo "No diff available")
+
+          # Build prompt using file to avoid escaping issues
+          cat > /tmp/prompt.txt << 'PROMPT_HEADER'
+          You are a helpful assistant that analyzes git merge conflicts. Based on the following information, generate a well-structured GitHub issue in Markdown format.
+
+          ## Conflict Information
+
+          ### Conflicting Files:
+          PROMPT_HEADER
+
+          cat /tmp/conflict_files.txt >> /tmp/prompt.txt 2>/dev/null || echo "Unknown" >> /tmp/prompt.txt
+
+          cat >> /tmp/prompt.txt << 'PROMPT_MID1'
+
+          ### New Upstream Commits:
+          PROMPT_MID1
+
+          cat /tmp/upstream_log.txt >> /tmp/prompt.txt 2>/dev/null || echo "Unknown" >> /tmp/prompt.txt
+
+          cat >> /tmp/prompt.txt << 'PROMPT_MID2'
+
+          ### Diff/Conflict Content (partial):
+          PROMPT_MID2
+
+          head -500 /tmp/diff_content.txt >> /tmp/prompt.txt 2>/dev/null || echo "No diff available" >> /tmp/prompt.txt
+
+          cat >> /tmp/prompt.txt << 'PROMPT_FOOTER'
+
+          ---
+
+          Please generate a GitHub issue with the following sections:
+          1. **問題摘要** (Problem Summary) - Brief description of what happened
+          2. **衝突分析** (Conflict Analysis) - Analyze which files conflict and why  
+          3. **影響評估** (Impact Assessment) - What functionality might be affected
+          4. **建議解法** (Suggested Resolution) - Step-by-step guide to resolve
+          5. **相關 Commits** (Related Commits) - List the upstream commits involved
+
+          Write in Traditional Chinese (繁體中文). Be concise but thorough.
+          PROMPT_FOOTER
+
+          # Escape prompt for JSON using jq
+          PROMPT_ESCAPED=$(jq -Rs '.' < /tmp/prompt.txt)
+
+          # Build request body using jq to ensure proper JSON formatting
+          # This avoids issues with shell variable expansion in heredoc
+          LLM_MODEL="${{ env.LLM_MODEL }}"
+          jq -n \
+            --arg model "$LLM_MODEL" \
+            --argjson content "$PROMPT_ESCAPED" \
+            '{
+              model: $model,
+              messages: [{role: "user", content: $content}],
+              temperature: 0.3,
+              max_tokens: 2000
+            }' > /tmp/request.json
+
+          # Call LLM API
+          HTTP_CODE=$(curl -s -w "%{http_code}" --max-time 120 -o /tmp/llm_response.json \
+            -X POST "${LLM_API_BASE}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${LLM_API_KEY}" \
+            -d @/tmp/request.json)
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ LLM API returned HTTP $HTTP_CODE"
+            cat /tmp/llm_response.json 2>/dev/null || true
+            echo "llm_success=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract content using jq
+          if jq -e '.choices[0].message.content' /tmp/llm_response.json > /dev/null 2>&1; then
+            jq -r '.choices[0].message.content' /tmp/llm_response.json > /tmp/issue_body.md
+            echo "llm_success=true" >> $GITHUB_OUTPUT
+            echo "✅ LLM analysis completed."
+          else
+            echo "❌ Failed to extract LLM content."
+            cat /tmp/llm_response.json 2>/dev/null || true
+            echo "llm_success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create fallback issue content
+        if: steps.fetch.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'false' && steps.check_issue.outputs.exists == 'false' && steps.llm_analysis.outputs.llm_success != 'true'
+        run: |
+          # Read values from files
+          CONFLICT_FILES=$(cat /tmp/conflict_files.txt 2>/dev/null || echo "Unable to determine")
+          UPSTREAM_LOG=$(cat /tmp/upstream_log.txt 2>/dev/null || echo "Unable to determine")
+
+          # Use environment variables for upstream info
+          OWNER="${{ env.UPSTREAM_OWNER }}"
+          REPO="${{ env.UPSTREAM_REPO }}"
+          BRANCH="${{ env.UPSTREAM_BRANCH }}"
+
+          cat > /tmp/issue_body.md << ISSUE_EOF
+          ## 問題摘要
+
+          自動同步上游 [${OWNER}/${REPO}](https://github.com/${OWNER}/${REPO}) 時發生合併衝突，需要手動處理。
+
+          ## 衝突檔案
+
+          \`\`\`
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          ## 上游新 Commits
+
+          \`\`\`
+          ${UPSTREAM_LOG}
+          \`\`\`
+
+          ## 建議解法
+
+          1. 在本地 clone repository
+          2. 執行以下命令：
+             \`\`\`bash
+             git remote add upstream https://github.com/${OWNER}/${REPO}.git
+             git fetch upstream ${BRANCH}
+             git merge upstream/${BRANCH}
+             \`\`\`
+          3. 手動解決衝突
+          4. 提交並推送變更
+          5. 關閉此 Issue
+
+          ## 相關連結
+
+          - [上游 Repository](https://github.com/${OWNER}/${REPO})
+          - [比較變更](https://github.com/${OWNER}/${REPO}/compare/${BRANCH}...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ github.ref_name }})
+          ISSUE_EOF
+
+          echo "✅ Fallback issue content created."
+
+      - name: Create issue for merge conflict
+        if: steps.fetch.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'false' && steps.check_issue.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Read issue body
+            let issueBody;
+            try {
+              issueBody = fs.readFileSync('/tmp/issue_body.md', 'utf8');
+            } catch (e) {
+              issueBody = '## Error\n\nFailed to generate issue content. Please check the workflow logs.';
+            }
+
+            // Ensure label exists
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'upstream-sync',
+                color: 'f9a825',
+                description: 'Issues related to upstream synchronization'
+              });
+            } catch (e) {
+              // Label already exists, ignore
+            }
+
+            // Create issue
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔄 Upstream Sync Failed - Merge Conflict Detected',
+              body: issueBody,
+              labels: ['upstream-sync']
+            });
+
+            console.log(`✅ Created issue #${issue.data.number}`);
+
+      - name: Push merged changes
+        if: steps.fetch.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          echo "Pushing merged changes..."
+          git push origin ${{ github.ref_name }}
+          echo "✅ Successfully synced with upstream and pushed changes."
+          echo "📦 Docker image will be built by the push trigger."
