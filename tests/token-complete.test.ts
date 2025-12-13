@@ -1,5 +1,9 @@
 import { describe, it, expect } from "bun:test";
-import { tokenComplete } from "../src/token-complete";
+import {
+  completeMarkdown,
+  tokenComplete,
+  tokenCompleteAt,
+} from "../src/token-complete";
 
 describe("token-complete", () => {
   describe("no splitting needed", () => {
@@ -73,14 +77,11 @@ describe("token-complete", () => {
   });
 
   describe("code blocks (```)", () => {
-    // Note: remend does NOT close code blocks with newlines (by design for streaming)
-    // So we test inline code block behavior instead
-    it("should handle inline code block (no newline)", () => {
-      const input = "```code```";
-      const result = tokenComplete(input, 6);
-      // "```cod" doesn't get closed by remend as it's not a complete pattern
-      expect(result.completed).toBe("```cod");
-      expect(result.overflow).toBe("e```");
+    it("should close and reopen code fence when split", () => {
+      const input = "```js\nhello world\n```";
+      const result = tokenComplete(input, 8);
+      expect(result.completed).toBe("```js\nhe\n```");
+      expect(result.overflow).toBe("```js\nllo world\n```");
     });
   });
 
@@ -118,6 +119,58 @@ describe("token-complete", () => {
       const result = tokenComplete(input, 15);
       // remend should close both tags
       expect(result.completed).toContain("**");
+    });
+  });
+
+  describe("code block protection", () => {
+    it("should not add closing * for asterisks inside inline code", () => {
+      const input = "Use `response.*` pattern";
+      const result = tokenComplete(input, 100);
+      expect(result.completed).toBe(input);
+    });
+
+    it("should not add closing * for asterisks inside code fences", () => {
+      const input = "```js\nconst x = 5 * 2;\n```";
+      const result = tokenComplete(input, 100);
+      expect(result.completed).toBe(input);
+    });
+
+    it("should still close unclosed italic outside code blocks", () => {
+      const input = "*italic with `code*` inside";
+      const result = tokenComplete(input, 100);
+      // The first * opens italic, the * in code doesn't close it, so we add *
+      expect(result.completed).toBe("*italic with `code*` inside*");
+    });
+
+    it("should handle mixed code and formatting", () => {
+      const input = "**bold** and `code with *` here";
+      const result = tokenComplete(input, 100);
+      expect(result.completed).toBe(input);
+    });
+
+    it("should handle multiple code blocks with asterisks", () => {
+      const input = "First `a*b` then `c*d` end";
+      const result = tokenComplete(input, 100);
+      expect(result.completed).toBe(input);
+    });
+
+    it("should close unclosed inline code without adding extra *", () => {
+      const input = "`response.*";
+      const result = tokenComplete(input, 100);
+      // Should add closing backtick, not closing *
+      expect(result.completed).toBe("`response.*`");
+    });
+
+    it("should handle unclosed code with asterisks and spaces", () => {
+      const input = "`a * b";
+      const result = tokenComplete(input, 100);
+      expect(result.completed).toBe("`a * b`");
+    });
+
+    it("should close unclosed code fence with asterisks", () => {
+      const input = "```js\nconst x = 5 *";
+      const result = tokenComplete(input, 100);
+      expect(result.completed).toBe("```js\nconst x = 5 *\n```");
     });
   });
 
@@ -224,6 +277,192 @@ describe("token-complete", () => {
         const openCount = (msg.match(/\*\*/g) || []).length;
         expect(openCount % 2).toBe(0); // Even number of ** means balanced
       }
+    });
+  });
+
+  describe("discord.ts pusher simulation", () => {
+    /**
+     * Simulates the exact logic from discord.ts startContentPusher
+     * to verify no extra closing tags appear.
+     *
+     * Key insight: tokenComplete is only used for STREAMING display.
+     * Final display uses raw content directly to avoid remend's
+     * overly aggressive closing (e.g., `response.*` in backticks).
+     */
+    function simulatePusher(
+      chunks: string[],
+      maxLength: number,
+    ): {
+      finalDisplays: string[];
+      rawBuffers: string[];
+      streamingDisplays: string[];
+    } {
+      const rawBuffers: string[] = [""];
+      const streamingDisplays: string[] = [];
+      let pushedIndex = 0;
+      let contentAcc = "";
+
+      // Simulate streaming chunks
+      for (const chunk of chunks) {
+        contentAcc += chunk;
+        const content = contentAcc;
+        const delta = content.slice(pushedIndex);
+
+        if (delta.length > 0) {
+          const rawBuffer = rawBuffers.at(-1) ?? "";
+          const tempBuf = rawBuffer.concat(delta);
+          const isOverflow = tempBuf.length > maxLength;
+
+          const { completed: displayBuffer, overflow: overflowPrefix } =
+            tokenComplete(tempBuf, maxLength);
+
+          // Store raw content (up to maxLength) without auto-closed tags
+          const rawContentForThisChunk = tempBuf.slice(0, maxLength);
+          rawBuffers[rawBuffers.length - 1] = rawContentForThisChunk;
+          pushedIndex += rawContentForThisChunk.length - rawBuffer.length;
+
+          // Record what would be displayed during streaming (with auto-close)
+          streamingDisplays.push(displayBuffer);
+
+          if (isOverflow) rawBuffers.push(overflowPrefix);
+        }
+      }
+
+      // Final display applies tokenComplete to properly close any open tags
+      // (safeRemend inside tokenComplete protects code blocks from incorrect handling)
+      const finalDisplays = rawBuffers.map(
+        (raw) => tokenComplete(raw, maxLength).completed,
+      );
+
+      return { finalDisplays, rawBuffers, streamingDisplays };
+    }
+
+    it("should not have extra closing tags for simple italic text", () => {
+      const chunks = ["*this ", "is a ", "sentence*"];
+      const { finalDisplays, rawBuffers } = simulatePusher(chunks, 100);
+
+      expect(rawBuffers).toEqual(["*this is a sentence*"]);
+      expect(finalDisplays).toEqual(["*this is a sentence*"]);
+    });
+
+    it("should not have extra closing tags for bold text", () => {
+      const chunks = ["**bold ", "text ", "here**"];
+      const { finalDisplays, rawBuffers } = simulatePusher(chunks, 100);
+
+      expect(rawBuffers).toEqual(["**bold text here**"]);
+      expect(finalDisplays).toEqual(["**bold text here**"]);
+    });
+
+    it("should handle text that starts open and closes later", () => {
+      const chunks = ["*start", " middle", " end*"];
+      const { finalDisplays, rawBuffers } = simulatePusher(chunks, 100);
+
+      expect(rawBuffers).toEqual(["*start middle end*"]);
+      expect(finalDisplays).toEqual(["*start middle end*"]);
+    });
+
+    it("should handle fake article with formatting", () => {
+      const article = `**Breaking News: Local Cat Discovers Keyboard**
+
+*By Jane Doe*
+
+A local cat named Whiskers has reportedly discovered the household keyboard, leading to several unexpected emails being sent to coworkers.
+
+"We were *shocked* to find out that Whiskers had been communicating with the IT department," said the cat's owner.
+
+The cat's messages included:
+- \`asdfghjkl;\`
+- \`qwertyuiop\`
+- **urgent meeting request**
+
+More details to follow.`;
+
+      // Split article into small chunks (simulating token-by-token streaming)
+      const chunkSize = 15;
+      const chunks: string[] = [];
+      for (let i = 0; i < article.length; i += chunkSize) {
+        chunks.push(article.slice(i, i + chunkSize));
+      }
+
+      const { finalDisplays, rawBuffers } = simulatePusher(chunks, 4096);
+
+      // Should be single message (article is short)
+      expect(rawBuffers.length).toBe(1);
+      expect(finalDisplays.length).toBe(1);
+
+      // Final display should match original article exactly
+      const finalDisplay = finalDisplays[0] ?? "";
+      expect(finalDisplay).toBe(article);
+      // No extra asterisks
+      expect(finalDisplay.endsWith("*")).toBe(false);
+    });
+
+    it("should handle unclosed formatting that gets closed later", () => {
+      // Simulates LLM generating: opens italic, writes content, closes italic
+      const chunks = [
+        "Here is ",
+        "*some italic",
+        " text that",
+        " continues*",
+        " and more",
+      ];
+      const { finalDisplays, rawBuffers } = simulatePusher(chunks, 100);
+
+      expect(rawBuffers).toEqual([
+        "Here is *some italic text that continues* and more",
+      ]);
+      expect(finalDisplays).toEqual([
+        "Here is *some italic text that continues* and more",
+      ]);
+    });
+
+    it("should handle message split across multiple Discord messages", () => {
+      const chunks = [
+        "**This is a very ",
+        "long bold text ",
+        "that will overflow**",
+      ];
+      const { finalDisplays, rawBuffers } = simulatePusher(chunks, 25);
+
+      // Should split into multiple messages
+      expect(rawBuffers.length).toBeGreaterThan(1);
+
+      // Each final display should have balanced markdown
+      for (const display of finalDisplays) {
+        const doubleStarCount = (display.match(/\*\*/g) || []).length;
+        expect(doubleStarCount % 2).toBe(0);
+      }
+    });
+  });
+
+  describe("tokenCompleteAt / completeMarkdown", () => {
+    it("should split at exact position", () => {
+      const result = tokenCompleteAt("hello", 2);
+      expect(result.completed).toBe("he");
+      expect(result.overflow).toBe("llo");
+    });
+
+    it("should close and reopen markdown tags when split", () => {
+      const input = "**bold text**";
+      const result = tokenCompleteAt(input, 8);
+      expect(result.completed).toBe("**bold t**");
+      expect(result.overflow).toBe("**ext**");
+    });
+
+    it("completeMarkdown should close dangling tags", () => {
+      expect(completeMarkdown("*hi")).toBe("*hi*");
+    });
+
+    it("completeMarkdown should close unclosed code fences", () => {
+      const input = "text\n```javascript\nconsole.log(1)\n";
+      expect(completeMarkdown(input)).toBe(
+        "text\n```javascript\nconsole.log(1)\n```",
+      );
+    });
+
+    it("completeMarkdown should close fences even without trailing newline", () => {
+      const input = "text\n```js\nconsole.log(1)";
+      expect(completeMarkdown(input)).toBe("text\n```js\nconsole.log(1)\n```");
     });
   });
 });
