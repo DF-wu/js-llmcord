@@ -12,6 +12,8 @@ export type Config = {
   use_plain_responses?: boolean;
   allow_dms?: boolean;
   debug_message?: boolean;
+  stats_for_nerds?: boolean;
+  per_channel_model?: boolean;
   experimental_overflow_splitting?: boolean;
   permissions: {
     users: {
@@ -63,6 +65,23 @@ export type ProviderConfig = Record<string, unknown> & {
 
 export type ModelConfig = Record<string, unknown> & {
   use_tools?: boolean; // default to true if tools are configured
+
+  /** Enables Anthropic prompt caching breakpoints. */
+  anthropic_cache_control?: boolean;
+  /** Optional Anthropic prompt cache TTL (e.g. "1h"). */
+  anthropic_cache_ttl?: string;
+  /**
+   * Controls whether tool definitions get Anthropic cacheControl.
+   * Default: false.
+   */
+  anthropic_cache_tools?: boolean;
+
+  /**
+   * AI Gateway upstream preference order for Anthropic models.
+   * Default: ["anthropic", "vertex", "bedrock"].
+   * If set to an empty array, the server will refuse to continue.
+   */
+  ai_gateway_order?: Array<"anthropic" | "bedrock" | "vertex">;
 };
 
 export type LocalMCPConfig = {

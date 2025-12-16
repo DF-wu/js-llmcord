@@ -96,6 +96,7 @@ export async function getProvidersFromConfig() {
             headers: providerConfig.extra_headers,
             queryParams: providerConfig.extra_query,
             fetch: fetchImpl,
+            includeUsage: Boolean(config.stats_for_nerds),
           }),
         ];
       }),

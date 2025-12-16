@@ -1,10 +1,5 @@
 import {
-  ActionRowBuilder,
   ActivityType,
-  ApplicationCommandOptionType,
-  ApplicationCommandType,
-  ButtonBuilder,
-  ButtonStyle,
   ChannelType,
   Client,
   Collection,
@@ -12,15 +7,9 @@ import {
   ComponentType,
   EmbedBuilder,
   GatewayIntentBits,
-  InteractionType,
   Message,
-  MessageFlags,
   MessageType,
-  ModalBuilder,
   Partials,
-  TextInputBuilder,
-  TextInputStyle,
-  type ApplicationCommandData,
   type CacheType,
   type Interaction,
 } from "discord.js";
@@ -31,33 +20,35 @@ import {
 } from "./model-routing";
 import {
   stepCountIs,
-  streamText,
   type CallWarning,
   type DataContent,
   type FinishReason,
   type LanguageModel,
   type ModelMessage,
-  type ReasoningOutput,
   type TextPart,
 } from "ai";
 import { getImageUrl } from "./image";
-import { inspect } from "bun";
 import { ToolManager } from "./tool";
 import type { Config } from "./type";
-import {
-  streamTextWithCompatibleTools,
-  type StreamTextParams,
-} from "./streaming-compatible";
+import { type StreamTextParams } from "./streaming-compatible";
 import { ModelMessageOperator } from "./model-messages";
-import { buildToolAuditNote, stripToolTraffic } from "./tool-transform";
 import {
   getRecommendedMemoryStringForUsers,
   getUsersFromModelMessages,
 } from "./rag/recommend";
 import { Logger } from "./logger";
-import { setTimeout } from "node:timers/promises";
-import { chunkMarkdownForEmbeds } from "./markdown-chunker";
 import { randomUUID } from "node:crypto";
+import { runStreamAttempt } from "./discord/stream-runner";
+import { handleInteraction } from "./discord/interaction-handlers";
+import { commands } from "./discord/commands";
+import { ensureCommands } from "./discord/ensure-commands";
+import {
+  getAiGatewayOrderFromModelConfig,
+  getAnthropicCacheControlFromModelConfig,
+  mergeProviderOptions,
+  withAnthropicSystemMessageCacheControl,
+  withAnthropicToolCacheControl,
+} from "./utils/anthropic-cache";
 
 const VISION_MODEL_TAGS = [
   "claude",
@@ -75,14 +66,6 @@ const VISION_MODEL_TAGS = [
   "vl",
 ] as const;
 
-const STREAMING_INDICATOR = " ⚪";
-const EDIT_DELAY_SECONDS = 0.1;
-// Buffer for potential closing tags when splitting markdown (worst case: **~~*` needs `*~~**)
-const CLOSING_TAG_BUFFER = 10;
-
-const EMBED_COLOR_COMPLETE = Colors.Blue;
-const EMBED_COLOR_INCOMPLETE = Colors.Yellow;
-
 const Warning = {
   maxText: "⚠️ Exceeding max text length per message.",
   maxImages: "⚠️ Exceeding max images per message.",
@@ -99,9 +82,62 @@ type JSONLike =
   | JSONLike[]
   | { [k: string]: JSONLike };
 
+export type ModelChannelRef = {
+  id: string;
+  parentId?: string | null;
+};
+
+/**
+ * Resolve the effective provider model for a Discord channel (per-channel mode).
+ * Logic:
+ * - If channel has a parentId (is a thread), check for thread override first
+ * - If no thread override but has parentId, check for parent channel override
+ * - If no override, use default model
+ */
+export function getEffectiveProviderModelPerChannel(
+  channel: ModelChannelRef,
+  overrides: Map<string, string>,
+  defaultModel: string,
+): string {
+  if (channel.parentId) {
+    const threadOverride = overrides.get(channel.id);
+    if (threadOverride) return threadOverride;
+
+    const parentOverride = overrides.get(channel.parentId);
+    if (parentOverride) return parentOverride;
+
+    return defaultModel;
+  }
+
+  return overrides.get(channel.id) ?? defaultModel;
+}
+
+/**
+ * Resolve the effective provider model based on configuration mode.
+ * - If per_channel_model is enabled: uses channel overrides with thread inheritance
+ * - If per_channel_model is disabled: returns global model (legacy behavior)
+ */
+export function getEffectiveProviderModel(
+  channel: ModelChannelRef,
+  perChannelModeEnabled: boolean,
+  perChannelOverrides: Map<string, string>,
+  defaultModel: string,
+  globalModel: string,
+): string {
+  return perChannelModeEnabled
+    ? getEffectiveProviderModelPerChannel(
+        channel,
+        perChannelOverrides,
+        defaultModel,
+      )
+    : globalModel;
+}
+
 export class DiscordOperator {
   private client: Client;
-  private curProviderModel = "openai/gpt-4o";
+  private defaultProviderModel = "openai/gpt-4o";
+  private globalProviderModel = "openai/gpt-4o"; // Used when per_channel_model is disabled (legacy mode)
+  private channelProviderModelOverrides = new Map<string, string>();
   private toolManager: ToolManager;
   private cachedConfig: Config = {} as Config;
   private modelMessageOperator = new ModelMessageOperator();
@@ -145,8 +181,9 @@ export class DiscordOperator {
     this.logger.setLogLevel(config.log_level ?? "info");
 
     this.cachedConfig = config;
-    this.curProviderModel =
-      Object.keys(config.models || {})[0] ?? "openai/gpt-4o";
+    const firstModel = Object.keys(config.models || {})[0] ?? "openai/gpt-4o";
+    this.defaultProviderModel = firstModel;
+    this.globalProviderModel = firstModel;
 
     await this.client.login(config.bot_token);
     await this.toolManager.init();
@@ -158,75 +195,13 @@ export class DiscordOperator {
     this.logger.logDebug("Discord operator initialized");
   }
 
-  private commands: Record<string, ApplicationCommandData> = {
-    model: {
-      name: "model",
-      description: "View or switch the current model",
-      type: ApplicationCommandType.ChatInput,
-      options: [
-        {
-          type: ApplicationCommandOptionType.String,
-          name: "model",
-          description: "Model name",
-          required: true,
-          autocomplete: true,
-        },
-      ],
-    },
-    "reload-tools": {
-      name: "reload-tools",
-      description: "Reload tools",
-      type: ApplicationCommandType.ChatInput,
-    },
-    tools: {
-      name: "tools",
-      description:
-        "Toggle tools for the models (use `/list-tools` to see available tools)",
-      type: ApplicationCommandType.ChatInput,
-      options: [
-        {
-          type: ApplicationCommandOptionType.String,
-          name: "tools",
-          description: "Tools to toggle on/off (comma-separated)",
-          required: true,
-        },
-      ],
-    },
-    "list-tools": {
-      name: "list-tools",
-      description: "List all available tools",
-      type: ApplicationCommandType.ChatInput,
-      options: [
-        {
-          type: ApplicationCommandOptionType.String,
-          name: "tool",
-          description: "Tool to get details for",
-          required: false,
-        },
-      ],
-    },
-  };
-
-  private async ensureCommands() {
-    this.cachedConfig = await getConfig();
-    if (!this.client.application) throw new Error("Client not initialized");
-    const cmds = await this.client.application.commands.fetch();
-    const commands = new Map(cmds.map((c) => [c.name, c]));
-
-    for (const [name, cmd] of Object.entries(this.commands)) {
-      this.logger.logDebug(`Register ${name} command`);
-      const existing = commands.get(name);
-      if (existing) {
-        await existing.edit(cmd);
-      } else {
-        await this.client.application.commands.create(cmd);
-      }
-    }
-  }
-
   private async clientReady() {
     this.cachedConfig = await getConfig();
-    await this.ensureCommands();
+    await ensureCommands({
+      client: this.client,
+      commands,
+      logger: this.logger,
+    });
     await this.setStatus();
     const clientId = this.cachedConfig.client_id
       ? String(this.cachedConfig.client_id)
@@ -249,184 +224,56 @@ export class DiscordOperator {
   };
 
   private interactionCreate = async (interaction: Interaction<CacheType>) => {
-    this.cachedConfig = await getConfig();
-
-    if (interaction.isButton()) {
-      if (interaction.customId === "show_reasoning_modal") {
-        this.logger.logDebug("[Interaction] show_reasoning_modal");
-
-        const messageId = interaction.message.id;
-        const reasoning = this.modelMessageOperator.getReasoning(messageId);
-        const existing = reasoning?.reasoning_summary ?? "No reasoning found.";
-
-        const modal = new ModalBuilder()
-          .setCustomId(`reasoning_modal:${messageId}`)
-          .setTitle("Reasoning summary");
-
-        const input = new TextInputBuilder()
-          .setCustomId("reasoning_text")
-          .setLabel("Model's reasoning summary")
-          .setStyle(TextInputStyle.Paragraph)
-          .setValue(existing.slice(0, 1900))
-          .setRequired(false);
-
-        const row = new ActionRowBuilder<TextInputBuilder>().addComponents(
-          input,
-        );
-        modal.addComponents(row);
-
-        await interaction.showModal(modal);
-        return;
-      }
-
-      if (interaction.customId.startsWith("cancel_")) {
-        const id = interaction.customId.replace("cancel_", "");
-        const controller = this.cancellationMap.get(id);
-
-        if (!controller) {
-          await interaction.reply({
-            content: "This generation is no longer active.",
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-
-        controller.abort();
-        this.cancellationMap.delete(id);
-        await interaction.reply({
-          content: "Request cancelled.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-    }
-
-    if (interaction.type === InteractionType.ApplicationCommandAutocomplete) {
-      const focused = interaction.options.getFocused(true);
-      if (interaction.commandName === "model" && focused.name === "model") {
-        this.logger.logDebug("[Interaction] model");
-        try {
-          if (interaction.responded) return;
-          const curr = this.curProviderModel;
-          const currStr = String(focused.value || "").toLowerCase();
-          const choices: Array<{ name: string; value: string }> = [];
-          if (curr.toLowerCase().includes(currStr))
-            choices.push({ name: `◉ ${curr} (current)`, value: curr });
-          for (const m of Object.keys(this.cachedConfig.models || {})) {
-            if (m === curr) continue;
-            if (!m.toLowerCase().includes(currStr)) continue;
-            choices.push({ name: `○ ${m}`, value: m });
-          }
-          await interaction.respond(choices.slice(0, 25));
-        } catch (e) {
-          this.logger.logError(e);
-          if (interaction.responded) return;
-          try {
-            await interaction.respond([]);
-          } catch (e) {
-            this.logger.logError(e);
-          }
-        }
-      }
-      return;
-    }
-
-    if (!interaction.isChatInputCommand()) return;
-    const isDM = interaction.channel?.type === ChannelType.DM;
-    if (interaction.commandName === "model") {
-      const model = interaction.options.getString("model", true);
-      const adminIds = decodeIds(this.cachedConfig.permissions.users.admin_ids);
-      const userIsAdmin = adminIds.has(interaction.user.id);
-      let output = "";
-
-      switch (true) {
-        case model === this.curProviderModel:
-          output = `Current model: \`${this.curProviderModel}\``;
-          break;
-        case userIsAdmin:
-          this.curProviderModel = model;
-          output = `Model switched to: \`${model}\``;
-          this.logger.logInfo(output);
-          break;
-        default:
-          output = "You don't have permission to change the model.";
-          break;
-      }
-
-      await interaction.reply({
-        content: output,
-        flags: isDM ? MessageFlags.Ephemeral : undefined,
-      });
-    }
-    if (interaction.commandName === "tools") {
-      const toolsRaw = interaction.options.getString("tools", true);
-      const adminIds = decodeIds(this.cachedConfig.permissions.users.admin_ids);
-      const userIsAdmin = adminIds.has(interaction.user.id);
-
-      let output = "";
-      if (!userIsAdmin) {
-        output = "You don't have permission to change the model.";
-      } else {
-        const tools = toolsRaw.split(",").map((t) => t.trim());
-        const outputs: string[] = [];
-        for (const tool of tools) {
-          if (this.toolManager.disabledTools.has(tool)) {
-            this.toolManager.disabledTools.delete(tool);
-            outputs.push(`- ◉ \`${tool}\``);
-          } else {
-            this.toolManager.disabledTools.add(tool);
-            outputs.push(`- ○ \`${tool}\``);
-          }
-        }
-        output = "**Updated tools:**\n" + outputs.join("\n");
-        this.logger.logInfo(output);
-      }
-
-      await interaction.reply({
-        content: output,
-        flags: isDM ? MessageFlags.Ephemeral : undefined,
-      });
-    }
-    if (interaction.commandName === "list-tools") {
-      const toolDetail = interaction.options.getString("tool", false);
-      await interaction.deferReply({
-        flags: isDM ? MessageFlags.Ephemeral : undefined,
-      });
-
-      const allTools = await this.toolManager.getAllTools();
-      const tools = Object.keys(allTools || {});
-      const list: string[] = [];
-      for (const tool of tools) {
-        const { description } = allTools?.[tool] || {};
-        let output = "";
-        if (this.toolManager.disabledTools.has(tool)) {
-          output = `- ○ \`${tool}\``;
-        } else {
-          output = `- ◉ \`${tool}\``;
-        }
-        if (toolDetail && toolDetail === tool) output += `\n  - ${description}`;
-        list.push(output);
-      }
-      await interaction.editReply({ content: list.join("\n").slice(0, 2000) });
-    }
-    if (interaction.commandName === "reload-tools") {
-      await interaction.deferReply({
-        flags: isDM ? MessageFlags.Ephemeral : undefined,
-      });
-      await interaction.editReply({ content: "Reloading tools..." });
-      await this.toolManager.destroy();
-      await this.toolManager.init();
-      this.logger.logDebug("[Interaction] reload-tools");
-      await interaction.editReply({ content: "Tools reloaded." });
-    }
+    await handleInteraction(interaction, {
+      getConfig,
+      setCachedConfig: (config: Config) => {
+        this.cachedConfig = config;
+      },
+      getCachedConfig: () => this.cachedConfig,
+      getProviderModelForChannel: (channel: {
+        id: string;
+        parentId?: string | null;
+      }) =>
+        getEffectiveProviderModel(
+          channel,
+          this.cachedConfig.per_channel_model ?? false,
+          this.channelProviderModelOverrides,
+          this.defaultProviderModel,
+          this.globalProviderModel,
+        ),
+      setProviderModelForChannel: (channelId: string, model: string) => {
+        this.channelProviderModelOverrides.set(channelId, model);
+      },
+      setGlobalProviderModel: (model: string) => {
+        this.globalProviderModel = model;
+      },
+      toolManager: this.toolManager,
+      cancellationMap: this.cancellationMap,
+      modelMessageOperator: this.modelMessageOperator,
+      retryFromMessage: async (msg: Message) =>
+        await this.generateForMessage(msg, { bypassMentionGate: true }),
+      logger: this.logger,
+      decodeIds,
+    });
   };
 
-  private async prepareMessageCreate(msg: Message) {
+  private async prepareMessageCreate(
+    msg: Message,
+    options?: { bypassMentionGate?: boolean },
+  ) {
     this.cachedConfig = await getConfig();
     // prevent infinite loop
     if (msg.author.bot) return false;
     const isDM = msg.channel.type === ChannelType.DM;
-    if (!isDM && !msg.mentions.users.has(this.client.user!.id)) return false;
+    const bypassMentionGate = options?.bypassMentionGate ?? false;
+    if (
+      !bypassMentionGate &&
+      !isDM &&
+      !msg.mentions.users.has(this.client.user!.id)
+    ) {
+      return false;
+    }
+
     const { roleIds, channelIds } = this.getChannelsAndRolesFromMessage(msg);
     const canRespond = this.getChannelPermission({
       messageAuthorId: msg.author.id,
@@ -435,9 +282,15 @@ export class DiscordOperator {
       channelIds,
     });
     if (!canRespond) return false;
-    const { provider, model, gatewayAdapter } = parseProviderModelString(
-      this.curProviderModel,
+    const effectiveModel = getEffectiveProviderModel(
+      msg.channel,
+      this.cachedConfig.per_channel_model ?? false,
+      this.channelProviderModelOverrides,
+      this.defaultProviderModel,
+      this.globalProviderModel,
     );
+    const { provider, model, gatewayAdapter } =
+      parseProviderModelString(effectiveModel);
     const providers = await getProvidersFromConfig();
     if (!providers[provider]) {
       this.logger.logError(`Configuration not found for provider: ${provider}`);
@@ -471,16 +324,26 @@ export class DiscordOperator {
       provider,
       model,
       gatewayAdapter,
+      effectiveModel,
     };
   }
 
-  private async prepareStreamOptions(msg: Message) {
-    const prepared = await this.prepareMessageCreate(msg);
+  private async prepareStreamOptions(
+    msg: Message,
+    options?: { bypassMentionGate?: boolean },
+  ) {
+    const prepared = await this.prepareMessageCreate(msg, options);
     if (!prepared) return false;
-    const { modelInstance, isAnthropic, provider, gatewayAdapter } = prepared;
+    const {
+      modelInstance,
+      isAnthropic,
+      provider,
+      gatewayAdapter,
+      effectiveModel,
+    } = prepared;
 
-    const { messages, userWarnings, currentMessageImageIds } =
-      await this.buildMessages(msg);
+    let { messages, userWarnings, currentMessageImageIds } =
+      await this.buildMessages(msg, effectiveModel);
 
     const usePlainResponses = this.cachedConfig.use_plain_responses ?? false;
     let warnEmbed: EmbedBuilder | null = null;
@@ -494,10 +357,13 @@ export class DiscordOperator {
       }
     }
 
-    const params = this.cachedConfig.models[this.curProviderModel];
+    const params = this.cachedConfig.models[effectiveModel];
     const {
       tools: useTools,
       anthropic_cache_control,
+      anthropic_cache_ttl,
+      anthropic_cache_tools,
+      ai_gateway_order,
       temperature,
       max_tokens,
       top_p,
@@ -506,31 +372,52 @@ export class DiscordOperator {
     } = params ?? {};
     const toolsDisabledForModel = useTools === false;
     const useCompatibleTools = useTools === "compatible";
-    const restPart = params
-      ? {
-          providerOptions: {
-            [gatewayAdapter ?? provider]: keysToCamel(rest),
-          },
-        }
-      : {};
 
-    // Get tools
-    const tools = toolsDisabledForModel
+    const anthropicCacheControl =
+      isAnthropic && anthropic_cache_control
+        ? getAnthropicCacheControlFromModelConfig({
+            anthropic_cache_control,
+            anthropic_cache_ttl,
+          })
+        : null;
+
+    const gatewayOrder =
+      provider === "ai-gateway" && isAnthropic
+        ? getAiGatewayOrderFromModelConfig({ ai_gateway_order })
+        : null;
+
+    const configProviderKey = gatewayAdapter ?? provider;
+    const configProviderOptions = keysToCamel(rest) as Record<string, unknown>;
+
+    const providerOptions = mergeProviderOptions(
+      params
+        ? {
+            [configProviderKey]: configProviderOptions,
+          }
+        : undefined,
+      provider === "ai-gateway" && gatewayOrder
+        ? { gateway: { order: gatewayOrder } }
+        : undefined,
+    ) as StreamTextParams["providerOptions"];
+
+    const restPart = providerOptions ? ({ providerOptions } as const) : {};
+
+    let tools = toolsDisabledForModel
       ? undefined
       : await this.toolManager.getTools();
 
-    if (isAnthropic && anthropic_cache_control) {
+    if (anthropicCacheControl) {
       this.logger.logDebug(
-        "Patching system message for Anthropic API with cache enabled",
+        "Patching system messages for Anthropic cache control",
       );
-      for (const msg of messages) {
-        if (msg.role !== "system") continue;
-        msg.providerOptions = {
-          ...msg.providerOptions,
-          anthropic: {
-            cacheControl: { type: "ephemeral" },
-          },
-        };
+      messages = withAnthropicSystemMessageCacheControl(
+        messages,
+        anthropicCacheControl,
+      );
+
+      if (anthropic_cache_tools === true) {
+        this.logger.logDebug("Patching tools for Anthropic cache control");
+        tools = withAnthropicToolCacheControl(tools, anthropicCacheControl);
       }
     }
 
@@ -581,6 +468,8 @@ export class DiscordOperator {
       compatibleMode: Boolean(tools && useCompatibleTools),
       usePlainResponses,
       warnEmbed,
+      anthropicCacheControl,
+      effectiveModel,
     };
   }
 
@@ -627,156 +516,17 @@ export class DiscordOperator {
     }
   }
 
-  private async startContentPusher({
-    baseMsg,
-    getContent,
-    getMaxLength,
-    streamDone,
-    warnEmbed,
-    useSmartSplitting,
-  }: {
-    baseMsg: Message;
-    getContent: () => string;
-    getMaxLength: (isStreaming: boolean) => number;
-    streamDone: Promise<void>;
-    warnEmbed: EmbedBuilder | null;
-    useSmartSplitting: boolean;
-  }) {
-    let streaming = true;
-    let loopIterations = 0;
-    streamDone.then(() => {
-      streaming = false;
-      this.logger.logDebug(
-        `[Pusher] streamDone resolved, loopIterations=${loopIterations}, contentLength=${getContent().length}`,
-      );
-    });
-
-    const chunkMessages: Message[] = [];
-    const discordMessageCreated: string[] = [];
-
-    // Cache the last embed state we sent, to avoid spamming the Discord API.
-    const sentDescriptions: string[] = [];
-    const sentColors: number[] = [];
-
-    // Last computed display chunks (no indicator).
-    let responseQueue: string[] = [];
-
-    const buildEmbed = (description: string, color: number) => {
-      const emb = warnEmbed
-        ? new EmbedBuilder(warnEmbed.toJSON())
-        : new EmbedBuilder();
-      emb.setDescription(description || "*\<empty_string\>*");
-      emb.setColor(color);
-      return emb;
-    };
-
-    const syncToDiscord = async (content: string): Promise<boolean> => {
-      // Reserve room for the streaming indicator in the last chunk, even after the
-      // stream is done. This keeps message boundaries stable and avoids shrinking.
-      const maxChunkLength = getMaxLength(false);
-      const maxLastChunkLength = getMaxLength(true);
-
-      const displayChunks = chunkMarkdownForEmbeds(content, {
-        maxChunkLength,
-        maxLastChunkLength,
-        useSmartSplitting,
-      });
-
-      responseQueue = displayChunks;
-
-      if (displayChunks.length === 0) {
-        return false;
-      }
-
-      let didUpdate = false;
-
-      for (let i = 0; i < displayChunks.length; i++) {
-        const chunk = displayChunks[i] ?? "";
-        const isLast = i === displayChunks.length - 1;
-        const showStreamIndicator = streaming && isLast;
-
-        const description = (() => {
-          if (!showStreamIndicator) return chunk;
-
-          // If the chunk ends with a block-closing marker, keep that marker intact
-          // on its own line (e.g. ``` or $$) so the block still renders.
-          const lines = chunk.split("\n");
-          for (let j = lines.length - 1; j >= 0; j--) {
-            const trimmed = (lines[j] ?? "").trim();
-            if (trimmed.length === 0) continue;
-
-            if (trimmed === "```" || trimmed === "$$") {
-              // Keep indicator length stable ("\n⚪" vs " ⚪").
-              return chunk + "\n" + STREAMING_INDICATOR.trimStart();
-            }
-            break;
-          }
-
-          return chunk + STREAMING_INDICATOR;
-        })();
-        const color = showStreamIndicator
-          ? EMBED_COLOR_INCOMPLETE
-          : EMBED_COLOR_COMPLETE;
-
-        const emb = buildEmbed(description, color);
-
-        if (i >= chunkMessages.length) {
-          const parent = i === 0 ? baseMsg : chunkMessages[i - 1]!;
-          const msg = await parent.reply({
-            embeds: [emb],
-            allowedMentions: { parse: [], repliedUser: false },
-          });
-
-          chunkMessages.push(msg);
-          discordMessageCreated.push(msg.id);
-          sentDescriptions[i] = description;
-          sentColors[i] = color;
-          didUpdate = true;
-          continue;
-        }
-
-        if (sentDescriptions[i] !== description || sentColors[i] !== color) {
-          await this.safeEdit(chunkMessages[i]!, { embeds: [emb] });
-          sentDescriptions[i] = description;
-          sentColors[i] = color;
-          didUpdate = true;
-        }
-      }
-
-      return didUpdate;
-    };
-
-    while (true) {
-      loopIterations++;
-      const content = getContent();
-      const didUpdate = await syncToDiscord(content);
-
-      if (!streaming) {
-        // Keep syncing until we observe a stable (fully finalized) state.
-        if (!didUpdate) {
-          this.logger.logDebug(
-            `[Pusher] exiting loop: iterations=${loopIterations}, contentLength=${content.length}, messagesCreated=${discordMessageCreated.length}`,
-          );
-          break;
-        }
-        continue;
-      }
-
-      await setTimeout(EDIT_DELAY_SECONDS * 1000);
-    }
-
-    const lastMsg = chunkMessages.at(-1) ?? baseMsg;
-
-    return {
-      lastMsg,
-      responseQueue,
-      discordMessageCreated,
-    };
-  }
-
   private messageCreate = async (msg: Message) => {
-    const options = await this.prepareStreamOptions(msg);
-    if (!options) return;
+    await this.generateForMessage(msg);
+  };
+
+  private async generateForMessage(
+    msg: Message,
+    options?: { bypassMentionGate?: boolean },
+  ) {
+    const streamOptions = await this.prepareStreamOptions(msg, options);
+    if (!streamOptions) return false;
+
     const {
       id,
       opts,
@@ -785,151 +535,43 @@ export class DiscordOperator {
       compatibleMode,
       usePlainResponses,
       warnEmbed,
-    } = options;
+      anthropicCacheControl,
+      effectiveModel,
+    } = streamOptions;
 
     const typingInterval = setInterval(() => this.sendTyping(msg), 1000 * 5);
-    let btnMessage: Message | null = null;
     try {
-      const cancelButton = new ButtonBuilder()
-        .setCustomId(`cancel_${id}`)
-        .setLabel("Cancel")
-        .setStyle(ButtonStyle.Danger);
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        cancelButton,
-      );
-      btnMessage = await msg.reply({
-        content: "*Replying...*",
-        components: [row],
-        allowedMentions: { parse: [], repliedUser: false },
-      });
-
       this.sendTyping(msg);
 
       const generateStream = async () => {
-        const stream = compatibleMode
-          ? streamTextWithCompatibleTools({ ...opts, logger: this.logger })
-          : streamText(opts);
-
-        const { textStream, finishReason, response, reasoning, warnings } =
-          stream;
-        if (this.cachedConfig.debug_message) {
-          this.logger.logDebug(inspect(messages));
-        }
-
-        let contentAcc = "";
-        const streamingDonePromise = new Promise<void>((resolve) => {
-          (async () => {
-            for await (const textPart of textStream) contentAcc += textPart;
-            resolve();
-          })();
-        });
-
-        const useSmartSplitting =
-          this.cachedConfig.experimental_overflow_splitting ?? false;
-        const pusherPromise = this.startContentPusher({
-          baseMsg: msg,
-          getContent: () => contentAcc,
-          getMaxLength: (isStreaming) =>
-            usePlainResponses
-              ? 4000
-              : isStreaming
-                ? 4096 -
-                  STREAMING_INDICATOR.length -
-                  (useSmartSplitting ? CLOSING_TAG_BUFFER : 0)
-                : 4096 - (useSmartSplitting ? CLOSING_TAG_BUFFER : 0),
-          streamDone: streamingDonePromise,
+        await runStreamAttempt({
+          ctx: {
+            logger: this.logger,
+            config: this.cachedConfig,
+            curProviderModel: effectiveModel,
+            safeEdit: this.safeEdit.bind(this),
+            logStreamWarning: this.logStreamWarning.bind(this),
+            logStreamFinishReason: this.logStreamFinishReason.bind(this),
+            modelMessageOperator: this.modelMessageOperator,
+          },
+          msg,
+          id,
+          opts,
+          messages,
+          currentMessageImageIds,
+          compatibleMode,
+          usePlainResponses,
           warnEmbed,
-          useSmartSplitting,
+          anthropicCacheControl,
+          typingInterval,
         });
-
-        await streamingDonePromise;
-        const reason = await finishReason;
-        let { lastMsg, responseQueue, discordMessageCreated } =
-          await pusherPromise;
-        // Only throw "No content generated" if finishReason is not "tool-calls"
-        // When model calls tools, content can be empty which is expected behavior
-        if (contentAcc.length === 0 && reason !== "tool-calls") {
-          await Promise.all(
-            discordMessageCreated.map((id) => msg.channel.messages.delete(id)),
-          );
-          throw new Error("No content generated");
-        }
-
-        if (usePlainResponses) {
-          for (const content of responseQueue) {
-            lastMsg = await lastMsg.reply({
-              content,
-              allowedMentions: { parse: [], repliedUser: false },
-            });
-          }
-        }
-
-        clearInterval(typingInterval);
-
-        this.logger.logInfo(`received total text length: ${contentAcc.length}`);
-        this.logStreamWarning(await warnings);
-        this.logStreamFinishReason(reason);
-
-        if (this.cachedConfig.debug_message) {
-          this.logger.logDebug(`Stream finished with reason: ${reason}`);
-        }
-
-        const resp = await response;
-        const stripped = stripToolTraffic(resp.messages);
-
-        if (this.cachedConfig.tools?.include_summary) {
-          const toolSummary = buildToolAuditNote(resp.messages);
-          if (stripped[0]?.role === "assistant" && toolSummary) {
-            if (typeof stripped[0].content === "string") {
-              stripped[0].content += `\n\n${toolSummary}`;
-            } else {
-              stripped[0].content.push({ type: "text", text: toolSummary });
-            }
-          }
-        }
-
-        const reasoningMessages: ReasoningOutput[] = [];
-        for (const msg of resp.messages) {
-          if (msg.role !== "assistant") continue;
-          if (typeof msg.content === "string") continue;
-          const parts = msg.content.filter((p) => p.type === "reasoning");
-          if (parts.length === 0) continue;
-          reasoningMessages.push(...parts);
-        }
-        const reasoningResp = await reasoning;
-
-        const reasoningSummary = (
-          reasoningResp.length > 0 ? reasoningResp : reasoningMessages
-        )
-          .map((r) => r.text)
-          .join("\n\n");
-        await this.modelMessageOperator.create({
-          messageId: discordMessageCreated,
-          parentMessageId: msg.id,
-          messages: stripped,
-          imageIds:
-            currentMessageImageIds.length > 0
-              ? currentMessageImageIds
-              : undefined,
-          reasoningSummary,
-        });
-
-        if (reasoningSummary) {
-          const button = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder()
-              .setCustomId("show_reasoning_modal")
-              .setLabel("Show reasoning")
-              .setStyle(ButtonStyle.Secondary),
-          );
-          this.safeEdit(lastMsg, { components: [button] });
-        }
       };
 
       const maxRetry = Math.max(1, this.cachedConfig.max_retry ?? 3);
       for (let i = 0; i < maxRetry; i++) {
         try {
           await generateStream();
-          break;
+          return true;
         } catch (e) {
           if (i + 1 === maxRetry) throw e;
           this.logger.logError(
@@ -938,14 +580,16 @@ export class DiscordOperator {
           );
         }
       }
+
+      return true;
     } catch (e) {
       this.logger.logError("Error while generating response", e);
+      return false;
     } finally {
       clearInterval(typingInterval);
       this.cancellationMap.delete(id);
-      await btnMessage?.delete();
     }
-  };
+  }
 
   private messageDelete = async (msg: { id: string }) => {
     await this.modelMessageOperator.removeAll(msg.id);
@@ -974,8 +618,8 @@ export class DiscordOperator {
     return true;
   }
 
-  private async buildMessages(msg: Message) {
-    const params = this.cachedConfig.models[this.curProviderModel];
+  private async buildMessages(msg: Message, effectiveModel: string) {
+    const params = this.cachedConfig.models[effectiveModel];
     const { tools: useTools } = params ?? {};
     const toolsDisabledForModel = useTools === false;
     const maxMessages = this.cachedConfig.max_messages ?? 25;
@@ -1006,7 +650,7 @@ export class DiscordOperator {
           message,
           userWarnings: uw,
           imageIds,
-        } = await this.messageToModelMessages(currMsg);
+        } = await this.messageToModelMessages(currMsg, effectiveModel);
 
         if (message) {
           messages.push(message);
@@ -1078,12 +722,12 @@ export class DiscordOperator {
     return { messages, userWarnings, currentMessageImageIds };
   }
 
-  private async messageToModelMessages(msg: Message) {
+  private async messageToModelMessages(msg: Message, effectiveModel: string) {
     const visionModels = (VISION_MODEL_TAGS as readonly string[]).concat(
       this.cachedConfig.additional_vision_models || [],
     );
     const acceptImages = visionModels.some((t) =>
-      this.curProviderModel.toLowerCase().includes(t),
+      effectiveModel.toLowerCase().includes(t),
     );
     const maxText = this.cachedConfig.max_text ?? 100000;
     const maxImages = acceptImages ? (this.cachedConfig.max_images ?? 5) : 0;

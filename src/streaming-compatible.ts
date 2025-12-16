@@ -4,11 +4,19 @@ import {
   type CallWarning,
   type FinishReason,
   type JSONValue,
+  type LanguageModelUsage,
   type ModelMessage,
   type ReasoningOutput,
   type ToolResultPart,
 } from "ai";
+
 import type { ILogger } from "./logger";
+import type { AnthropicCacheControl } from "./utils/anthropic-cache";
+import {
+  insertSystemMessageAfterLastSystem,
+  validateAnthropicCacheControlCoverage,
+  withAnthropicMessageCacheControl,
+} from "./utils/anthropic-cache";
 
 export type StreamTextParams = Parameters<typeof streamText>[0];
 export type StreamTextResult = Awaited<ReturnType<typeof streamText>>;
@@ -31,12 +39,64 @@ function maybeToolCallEnd(text: string) {
 }
 
 const toolCallIdPrefix = "compatible-tool";
+
+export function shouldInsertBoundarySeparator(
+  prevLastChar: string,
+  nextFirstChar: string,
+): boolean {
+  // Insert a small boundary when stitching streamed segments, but only when
+  // concatenation would merge markdown delimiters (e.g. `*` + `*` => `**`).
+  // This commonly happens around tool-call boundaries.
+  if (!prevLastChar || !nextFirstChar) return false;
+
+  const mergeable = new Set(["*", "_", "`", "~", "$"]);
+  return prevLastChar === nextFirstChar && mergeable.has(prevLastChar);
+}
+
+export function maybeYieldBoundarySeparator(
+  prevLastChar: string,
+  nextChunk: string,
+  separator: string = " ",
+): string {
+  if (!nextChunk) return "";
+  const nextFirstChar = nextChunk[0] ?? "";
+  return shouldInsertBoundarySeparator(prevLastChar, nextFirstChar) ? separator : "";
+}
+
+function addUsage(
+  target: LanguageModelUsage,
+  addition: LanguageModelUsage | null | undefined,
+) {
+  if (!addition) return;
+  if (typeof addition.inputTokens === "number") {
+    target.inputTokens = (target.inputTokens ?? 0) + addition.inputTokens;
+  }
+  if (typeof addition.outputTokens === "number") {
+    target.outputTokens = (target.outputTokens ?? 0) + addition.outputTokens;
+  }
+  if (typeof addition.totalTokens === "number") {
+    target.totalTokens = (target.totalTokens ?? 0) + addition.totalTokens;
+  }
+  if (typeof addition.reasoningTokens === "number") {
+    target.reasoningTokens =
+      (target.reasoningTokens ?? 0) + addition.reasoningTokens;
+  }
+  if (typeof addition.cachedInputTokens === "number") {
+    target.cachedInputTokens =
+      (target.cachedInputTokens ?? 0) + addition.cachedInputTokens;
+  }
+}
+
 export function streamTextWithCompatibleTools({
   tools,
   messages,
   logger,
+  anthropicCacheControl,
   ...rest
-}: StreamTextParams & { logger: ILogger }) {
+}: StreamTextParams & {
+  logger: ILogger;
+  anthropicCacheControl?: AnthropicCacheControl | null;
+}) {
   messages = [...(messages || [])];
 
   const toolDesc = Object.entries((tools = tools || {})).map(([name, tool]) => {
@@ -58,6 +118,11 @@ export function streamTextWithCompatibleTools({
       JSON.stringify(toolDesc, null, 2),
   };
 
+  const patchedCompatibleSystemPrompt = withAnthropicMessageCacheControl(
+    compatibleSystemPrompt,
+    anthropicCacheControl ?? null,
+  );
+
   const { promise: finishReason, resolve: resolveFinishReason } =
     Promise.withResolvers<FinishReason>();
 
@@ -71,6 +136,15 @@ export function streamTextWithCompatibleTools({
     CallWarning[] | undefined
   >();
 
+  const { promise: totalUsage, resolve: resolveTotalUsage } =
+    Promise.withResolvers<LanguageModelUsage>();
+
+  const totalUsageAccu: LanguageModelUsage = {
+    inputTokens: undefined,
+    outputTokens: undefined,
+    totalTokens: undefined,
+  };
+
   if (messages.length === 0) {
     throw new Error(
       "streamTextWithCompatibleTools requires at least one message",
@@ -81,14 +155,41 @@ export function streamTextWithCompatibleTools({
   const generateCallId = () => `${toolCallIdPrefix}-${++callSequence}`;
   const accumulatedWarnings: CallWarning[] = [];
   const textStreamOut = async function* () {
+    let lastEmittedChar = "";
+    let pendingBoundarySeparator = false;
+
     while (true) {
-      const { textStream, finishReason, response, reasoning, warnings } =
-        streamText({
-          ...rest,
-          messages: [compatibleSystemPrompt, ...messages],
-          prompt: undefined,
-          tools: undefined,
-        });
+      const messagesWithSystem = insertSystemMessageAfterLastSystem(
+        messages,
+        patchedCompatibleSystemPrompt,
+      );
+
+      validateAnthropicCacheControlCoverage(
+        messagesWithSystem,
+        anthropicCacheControl ?? null,
+        logger,
+        {
+          providerModel:
+            typeof rest.model === "string"
+              ? rest.model
+              : `${rest.model.provider}/${rest.model.modelId}`,
+          toolMode: "compatible",
+        },
+      );
+
+      const {
+        textStream,
+        finishReason,
+        response,
+        reasoning,
+        warnings,
+        totalUsage: callTotalUsage,
+      } = streamText({
+        ...rest,
+        messages: messagesWithSystem,
+        prompt: undefined,
+        tools: undefined,
+      });
 
       let buffer = "";
       let toolMatch: RegExpExecArray | null = null;
@@ -101,7 +202,17 @@ export function streamTextWithCompatibleTools({
           inToolCall = true;
           buffer = chunk;
         } else {
+          if (pendingBoundarySeparator) {
+            const sep = maybeYieldBoundarySeparator(lastEmittedChar, chunk);
+            if (sep) {
+              yield sep;
+              lastEmittedChar = sep.at(-1) ?? lastEmittedChar;
+            }
+            pendingBoundarySeparator = false;
+          }
+
           yield chunk;
+          lastEmittedChar = chunk.at(-1) ?? lastEmittedChar;
           continue;
         }
 
@@ -138,6 +249,13 @@ export function streamTextWithCompatibleTools({
       reasoningMessages.push(...(await reasoning));
       accumulatedWarnings.push(...((await warnings) || []));
 
+      addUsage(totalUsageAccu, await callTotalUsage);
+
+      // If the model just asked to call a tool, the next assistant phase will be
+      // produced in a subsequent streamText() call. Mark a boundary so we can
+      // avoid concatenating markdown tokens across the seam.
+      if (toolMatch) pendingBoundarySeparator = true;
+
       const [, toolName, payload] = toolMatch ?? [];
       const tool = toolName && tools?.[toolName];
       if (!toolName || !tool || !tool.execute) {
@@ -146,6 +264,7 @@ export function streamTextWithCompatibleTools({
           accumulatedWarnings.length ? accumulatedWarnings : undefined,
         );
         resolveFinishReason(await finishReason);
+        resolveTotalUsage(totalUsageAccu);
 
         if (carryOver) {
           yield carryOver;
@@ -210,6 +329,7 @@ export function streamTextWithCompatibleTools({
     response: finalResponses,
     reasoning,
     warnings,
+    totalUsage,
   };
 }
 
