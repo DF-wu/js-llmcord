@@ -72,11 +72,11 @@ export async function getProvidersFromConfig() {
       : null,
     google: config.providers.google
       ? createGoogleGenerativeAI({
-          baseURL: config.providers.google.base_url,  
+          baseURL: config.providers.google.base_url,
           apiKey: config.providers.google.api_key!,
           headers: config.providers.google.extra_headers,
         })
-      : null, 
+      : null,
     ...Object.fromEntries(
       openaiCompatibleProviders.map((p) => {
         const providerConfig = config.providers[p]!;
@@ -84,7 +84,10 @@ export async function getProvidersFromConfig() {
           providerConfig.compatibility?.patch_tool_call_index,
         );
         const fetchImpl = needsToolPatch
-          ? createToolCallIndexPatchedFetch(globalThis.fetch)
+          ? createToolCallIndexPatchedFetch(globalThis.fetch, {
+              patchToolCallIndex: true,
+              transformConstToEnum: true,
+            })
           : undefined;
 
         return [

@@ -49,7 +49,7 @@ providers:
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key:
     compatibility:
-      patch_tool_call_index: true # fixes missing tool_call indexes in streaming mode
+      patch_tool_call_index: true # enables Gemini tool schema conversion and tool_call index patching
   groq:
     base_url: https://api.groq.com/openai/v1
     api_key:

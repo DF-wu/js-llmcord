@@ -176,8 +176,13 @@ models:
 
 Some OpenAI-compatible providers (e.g., Gemini via axolotl/veloera gateway) have compatibility issues when using tools with the AI SDK:
 
-1. **`const` keyword not supported**: Gemini API doesn't support the `const` keyword in JSON Schema definitions, causing 400 errors.
+1. **Unsupported JSON Schema keywords**: Gemini API doesn't support several JSON Schema keywords, causing 400 errors:
+   - `const` → Converted to `enum` with single value
+   - `propertyNames`, `patternProperties`, `dependencies` → Removed
+   - `if`/`then`/`else`, `not` → Removed
+   - `$ref`, `$id`, `$schema`, `$comment` → Removed
 2. **Extra SSE chunks after tool calls**: Some providers send empty chunks after `finish_reason: "tool_calls"`, which breaks AI SDK's stream parsing.
+3. **Missing tool call indices**: Some providers don't include `index` fields in streaming tool calls, causing parsing errors.
 
 #### Usage
 
@@ -194,8 +199,9 @@ providers:
 
 #### What it does
 
-- **Request transformation**: Recursively removes all `const` keys from tool definitions and converts them to `enum` with a single value.
+- **Request transformation**: Recursively removes unsupported JSON Schema keywords from tool definitions and converts `const` to `enum`.
 - **Response stream filtering**: Filters out empty SSE chunks that appear after `finish_reason: "tool_calls"`.
+- **Index assignment**: Automatically assigns missing `index` fields to tool calls in streaming responses.
 - **Zero impact when disabled**: If `patch_tool_call_index` is not set or `false`, the provider behaves exactly as before.
 
 #### Debug mode
@@ -208,13 +214,52 @@ DEBUG=patch bun run index.ts
 
 #### Implementation
 
-The patch is implemented as a fetch wrapper in `src/tool-call-index-patch.ts`:
+The patch is implemented as a modular, defensive fetch wrapper in `src/tool-call-index-patch.ts`:
 
-- `transformConstToEnum()`: Recursively transforms JSON Schema to replace `const` with `enum`
-- `patchSseStream()`: Filters SSE stream to remove problematic empty chunks
-- `createToolCallIndexPatchedFetch()`: Main export that wraps the base fetch function
+**Architecture:**
+- **Configuration Layer**: Centralized config for easy updates when API requirements change
+  - `SCHEMA_TRANSFORM_CONFIG`: Keywords to remove/transform
+  - `STREAM_PATCH_CONFIG`: Stream patching behavior
+- **Utility Layer**: Defensive helpers for safe property access
+  - `safeGet()`: Type-safe nested property access
+  - `isValidArray()`, `isPlainObject()`: Type guards
+- **Transformation Layer**: JSON Schema compatibility
+  - `transformJsonSchema()`: Recursive schema transformation
+  - `transformRequestBody()`: Request body preprocessing
+- **Patching Layer**: Stream response handling
+  - `patchSseStream()`: SSE stream transformation
+  - `ensureToolCallIndex()`: Index assignment logic
+- **Main Export**: `createToolCallIndexPatchedFetch()` with extensibility options
+
+**Resilience Features:**
+- Defensive error handling: Returns original data on any error
+- Safe property access: No crashes on unexpected structures
+- Extensible: Custom keywords and transforms via options
+- Testable: Internal functions exported in debug mode
 
 The patch is applied conditionally in `src/model-routing.ts` only for providers with `compatibility.patch_tool_call_index: true`.
+
+#### Supported JSON Schema Keywords
+
+The patch ensures compatibility with Gemini API by removing these unsupported keywords:
+- `propertyNames` - Property name validation patterns
+- `patternProperties` - Pattern-based property matching
+- `dependencies` - Property dependencies
+- `if`/`then`/`else` - Conditional schemas
+- `not` - Schema negation
+- `$ref`, `$id`, `$schema`, `$comment` - Schema references and metadata
+
+The `const` keyword is converted to `enum` with a single value instead of being removed.
+
+**Extensibility:** You can add custom keywords to remove or transform:
+```typescript
+createToolCallIndexPatchedFetch(fetch, {
+  additionalKeywordsToRemove: ["customKeyword"],
+  customKeywordTransforms: {
+    myKeyword: (value) => ({ replacement: value })
+  }
+})
+```
 
 ## Docker Compose with RAG
 
