@@ -99,10 +99,12 @@ const SCHEMA_TRANSFORM_CONFIG = {
  *    - 某些 provider 在 tool_calls 完成後會發送空的 chunk
  *    - 這會導致 AI SDK 的串流解析器出錯
  *    - 需要過濾掉這些多餘的空 chunk
+ *    - ⚠️ 警告：這個功能可能導致正常響應被過濾，建議設為 false
  *
  *    - Some providers send empty chunks after tool_calls finish
  *    - This breaks AI SDK's stream parser
  *    - Need to filter out these extra empty chunks
+ *    - ⚠️ Warning: This feature may cause normal responses to be filtered, recommend setting to false
  *
  * 2. assignMissingIndices:
  *    - 某些 provider 不會在串流的 tool call 中包含 index 欄位
@@ -118,10 +120,13 @@ const STREAM_PATCH_CONFIG = {
    * 是否過濾 tool_calls 完成後的空 chunk
    * Whether to filter empty chunks after tool_calls finish
    *
-   * 設為 false 可能導致：串流解析錯誤
-   * Setting to false may cause: Stream parsing errors
+   * ⚠️ 目前設為 false 以避免過度過濾
+   * ⚠️ Currently set to false to avoid over-filtering
+   *
+   * 設為 true 可能導致：正常響應被錯誤過濾
+   * Setting to true may cause: Normal responses being incorrectly filtered
    */
-  filterEmptyChunksAfterToolCalls: true,
+  filterEmptyChunksAfterToolCalls: false,
 
   /**
    * 是否為缺失 index 的 tool call 自動分配索引
@@ -390,6 +395,26 @@ function safeGet<T>(obj: unknown, path: string[]): T | undefined {
 }
 
 /**
+ * 檢查值是否為陣列（可以為空）
+ * Check if a value is an array (can be empty)
+ *
+ * 用途：驗證一個值是陣列類型，不管是否有內容。
+ * Purpose: Verify a value is an array type, regardless of whether it has content.
+ *
+ * @param value - 要檢查的值 / Value to check
+ * @returns 是否為陣列 / Whether it's an array
+ *
+ * @example
+ * isArray([1, 2, 3])  // true
+ * isArray([])         // true
+ * isArray(null)       // false
+ * isArray("string")   // false
+ */
+function isArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+/**
  * 檢查值是否為有效的陣列（非空）
  * Check if a value is a valid array (non-empty)
  *
@@ -398,10 +423,10 @@ function safeGet<T>(obj: unknown, path: string[]): T | undefined {
  *
  * 為什麼要檢查長度？
  * Why check length?
- * - 空陣列通常表示沒有數據，不需要處理
+ * - 某些情況下需要確保陣列有內容才處理
  * - 可以避免不必要的迴圈和處理
  *
- * - Empty arrays usually mean no data, no need to process
+ * - In some cases need to ensure array has content before processing
  * - Can avoid unnecessary loops and processing
  *
  * @param value - 要檢查的值 / Value to check
@@ -610,9 +635,11 @@ function transformRequestBody(
     const json = JSON.parse(body);
 
     // Only transform if there are tools
+    // 注意：tools 必須是非空陣列才需要轉換
+    // Note: tools must be a non-empty array to need transformation
     const tools = safeGet<unknown[]>(json, ["tools"]);
-    if (!isValidArray(tools)) {
-      debugLog("No tools array found, skipping transformation");
+    if (!isArray(tools) || tools.length === 0) {
+      debugLog("No tools array found or empty, skipping transformation");
       return body;
     }
 
@@ -758,8 +785,16 @@ function patchChunkPayload(
     const json = JSON.parse(payload);
 
     // Defensive: check for expected structure
+    // 注意：choices 可以是空陣列，這是正常的（例如純文本響應）
+    // Note: choices can be an empty array, this is normal (e.g., pure text responses)
     const choices = safeGet<unknown[]>(json, ["choices"]);
-    if (!isValidArray(choices)) {
+    if (!isArray(choices)) {
+      return { patched: null, shouldFilter: false };
+    }
+
+    // 如果 choices 是空陣列，直接返回不處理
+    // If choices is an empty array, return directly without processing
+    if (choices.length === 0) {
       return { patched: null, shouldFilter: false };
     }
 
@@ -797,30 +832,57 @@ function patchChunkPayload(
 /**
  * Check if a chunk should be filtered out
  * Defensive: handles unexpected structures
+ *
+ * 過濾邏輯：
+ * Filtering logic:
+ * - 只有當所有 choice 的 delta 都是空的（沒有 content 也沒有 tool_calls）時才過濾
+ * - Only filter when all choice deltas are empty (no content and no tool_calls)
+ * - 如果無法判斷（結構異常），保守地不過濾
+ * - If unable to determine (abnormal structure), conservatively don't filter
  */
 function shouldFilterEmptyChunk(choices: unknown[]): boolean {
+  let hasValidChoice = false;  // 是否有至少一個有效的 choice
+  let allChoicesEmpty = true;  // 所有有效的 choice 是否都為空
+
   for (const choice of choices) {
     if (!isPlainObject(choice)) continue;
 
     const delta = safeGet<Record<string, unknown>>(choice, ["delta"]);
     if (!isPlainObject(delta)) continue;
 
+    // 這是一個有效的 choice（有 delta 物件）
+    hasValidChoice = true;
+
     const toolCalls = safeGet<unknown[]>(delta, ["tool_calls"]);
     const content = safeGet<string>(delta, ["content"]);
 
-    // If there are tool calls, don't filter
-    if (isValidArray(toolCalls)) {
-      return false;
+    // 如果有 tool calls（即使是空陣列也算有內容）
+    // If there are tool calls (even empty array counts as having content)
+    if (isArray(toolCalls) && toolCalls.length > 0) {
+      allChoicesEmpty = false;
+      break;
     }
 
-    // If there's non-empty content, don't filter
+    // 如果有非空 content
+    // If there's non-empty content
     if (typeof content === "string" && content.length > 0) {
-      return false;
+      allChoicesEmpty = false;
+      break;
     }
+
+    // 注意：content 可能是 null 或 undefined，這是正常的
+    // Note: content can be null or undefined, this is normal
+    // 只有當 content 明確是空字串時才認為這個 choice 是空的
+    // Only consider this choice empty when content is explicitly an empty string
   }
 
-  // All choices are empty, filter this chunk
-  return true;
+  // 只有當：
+  // Only filter when:
+  // 1. 至少有一個有效的 choice（避免誤判結構異常的 chunk）
+  // 2. 所有有效的 choice 都是空的
+  // 1. At least one valid choice exists (avoid misjudging structurally abnormal chunks)
+  // 2. All valid choices are empty
+  return hasValidChoice && allChoicesEmpty;
 }
 
 /**
@@ -1062,6 +1124,7 @@ export const __internal = DEBUG ? {
   ensureToolCallIndex,
   getToolCallKey,
   safeGet,
+  isArray,
   isValidArray,
   isPlainObject,
   shouldFilterEmptyChunk,
