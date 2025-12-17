@@ -190,12 +190,22 @@ Add `compatibility.patch_tool_call_index: true` to the provider config:
 
 ```yaml
 providers:
+  # For Google/Gemini (required for tool support)
+  google:
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key: your-api-key
+    compatibility:
+      patch_tool_call_index: true  # Enable the patch
+
+  # For other OpenAI-compatible providers
   my-openai-compatible-provider:
     base_url: http://your-gateway/v1
     api_key: your-api-key
     compatibility:
       patch_tool_call_index: true  # Enable the patch
 ```
+
+**Important:** Google/Gemini provider is now treated as an OpenAI-compatible provider to enable the patch. This is necessary for tool calling to work correctly with Gemini models.
 
 #### What it does
 

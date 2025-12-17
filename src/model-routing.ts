@@ -5,7 +5,8 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGroq } from "@ai-sdk/groq";
 import { createGateway } from "ai";
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
+// Note: @ai-sdk/google is no longer imported
+// Google provider is now created as OpenAI-compatible to support tool call patching
 import {
   createOpenAICompatible,
   type OpenAICompatibleProvider,
@@ -15,6 +16,8 @@ import { createToolCallIndexPatchedFetch } from "./tool-call-index-patch";
 
 export async function getProvidersFromConfig() {
   const config = await getConfig();
+  // Note: "google" is intentionally NOT in this list so it can use the patch
+  // Google provider needs the tool call index patch for Gemini compatibility
   const preConfigurable = [
     "openai",
     "x-ai",
@@ -22,7 +25,6 @@ export async function getProvidersFromConfig() {
     "openrouter",
     "groq",
     "ai-gateway",
-    "google",
   ];
   const openaiCompatibleProviders = Object.keys(config.providers).filter(
     (p) => !preConfigurable.includes(p),
@@ -70,13 +72,8 @@ export async function getProvidersFromConfig() {
           apiKey: config.providers["ai-gateway"].api_key,
         })
       : null,
-    google: config.providers.google
-      ? createGoogleGenerativeAI({
-          baseURL: config.providers.google.base_url,
-          apiKey: config.providers.google.api_key!,
-          headers: config.providers.google.extra_headers,
-        })
-      : null,
+    // Google is now handled as OpenAI-compatible provider below
+    // This allows the tool call index patch to be applied when configured
     ...Object.fromEntries(
       openaiCompatibleProviders.map((p) => {
         const providerConfig = config.providers[p]!;
