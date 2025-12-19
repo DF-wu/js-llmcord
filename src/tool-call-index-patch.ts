@@ -202,6 +202,37 @@ type ToolCallState = Map<number, ChoiceIndexState>;
 type MutableToolCall = Record<string, unknown> & { index?: number | string };
 
 /**
+ * Gemini 3 thought_signature 狀態管理
+ * Gemini 3 thought_signature state management
+ *
+ * 用途：在請求/響應循環間保存 thought_signature
+ * Purpose: Preserve thought_signature across request/response cycles
+ *
+ * 為什麼需要這個？
+ * Why is this needed?
+ * - Gemini 3 模型在 function calling 時會返回 thought_signature
+ * - 必須在下一次請求中將這個 signature 傳回給 API
+ * - 缺少 signature 會導致 400 錯誤："Function call is missing a thought_signature"
+ *
+ * - Gemini 3 models return thought_signature during function calling
+ * - This signature MUST be passed back to the API in the next request
+ * - Missing signature causes 400 error: "Function call is missing a thought_signature"
+ *
+ * @example
+ * const state: ThoughtSignatureState = { value: undefined };
+ * // After extracting from response:
+ * state.value = "encrypted_signature_string";
+ * // In next request, inject this value
+ */
+type ThoughtSignatureState = {
+  /**
+   * 最近提取的 thought_signature 值（加密字符串，不可修改）
+   * Most recently extracted thought_signature value (encrypted string, immutable)
+   */
+  value: string | undefined;
+};
+
+/**
  * 串流處理狀態
  * Stream processing state
  *
@@ -213,10 +244,12 @@ type MutableToolCall = Record<string, unknown> & { index?: number | string };
  * - SSE 串流是逐 chunk 處理的，需要跨 chunk 記住狀態
  * - 例如：記住是否已經看到 finish_reason: "tool_calls"
  * - 例如：記住每個 tool call 已分配的 index
+ * - 例如：從響應中提取 thought_signature（Gemini 3 專用）
  *
  * - SSE stream is processed chunk by chunk, need to remember state across chunks
  * - Example: Remember if we've seen finish_reason: "tool_calls"
  * - Example: Remember assigned indices for each tool call
+ * - Example: Extract thought_signature from response (Gemini 3 specific)
  */
 type StreamState = {
   /** 所有 choice 的 tool call 索引狀態 / Tool call index state for all choices */
@@ -225,6 +258,14 @@ type StreamState = {
   sawToolCallsFinish: boolean;
   /** 已處理的 chunk 數量（用於 debug） / Number of chunks processed (for debugging) */
   chunkCount: number;
+  /**
+   * 從當前串流中提取的 thought_signature（如果有）
+   * Thought signature extracted from current stream (if any)
+   *
+   * Gemini 3 專用：function calling 時會在響應中包含此字段
+   * Gemini 3 specific: Included in responses during function calling
+   */
+  thoughtSignature: string | undefined;
 };
 
 /**
@@ -280,6 +321,49 @@ export type ToolCallPatchOptions = {
    * @default true
    */
   patchToolCallIndex?: boolean;
+
+  /**
+   * 是否處理 Gemini 3 的 thought_signature（思考簽名）
+   * Whether to handle Gemini 3's thought_signature
+   *
+   * 用途：為 Gemini 3 Flash/Pro 模型啟用 function calling 支援
+   * Purpose: Enable function calling support for Gemini 3 Flash/Pro models
+   *
+   * 啟用時的行為：
+   * When enabled:
+   * - 從響應的 SSE chunk 中提取 thought_signature 字段
+   * - 將提取的 signature 存儲在閉包狀態中
+   * - 在下一次請求時，將 signature 注入到 assistant message 的 tool_calls 中
+   * - 注入位置：tool_calls[0].extra_content.google.thought_signature
+   *
+   * - Extract thought_signature field from response SSE chunks
+   * - Store extracted signature in closure state
+   * - In next request, inject signature into assistant message's tool_calls
+   * - Injection location: tool_calls[0].extra_content.google.thought_signature
+   *
+   * 為什麼需要這個？
+   * Why is this needed?
+   * - Gemini 3 在使用 function calling 時強制要求 thought_signature
+   * - 缺少此字段會導致 400 錯誤："Function call is missing a thought_signature"
+   * - 這是 Gemini 3 的新要求，Gemini 2.5 不需要
+   *
+   * - Gemini 3 strictly requires thought_signature when using function calling
+   * - Missing this field causes 400 error: "Function call is missing a thought_signature"
+   * - This is a new requirement for Gemini 3, not needed for Gemini 2.5
+   *
+   * 設為 false 時：
+   * When set to false:
+   * - 不會提取或注入 thought_signature
+   * - Gemini 3 的 function calling 會失敗
+   * - 其他 provider 不受影響
+   *
+   * - Won't extract or inject thought_signature
+   * - Gemini 3 function calling will fail
+   * - Other providers are not affected
+   *
+   * @default false
+   */
+  handleThoughtSignature?: boolean;
 
   /**
    * 額外需要移除的 JSON Schema 關鍵字（在預設清單之外）
@@ -470,6 +554,263 @@ function isValidArray(value: unknown): value is unknown[] {
  */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// ============================================================================
+// Gemini 3 thought_signature Support / Gemini 3 思考簽名支援
+// ============================================================================
+//
+// 這個區塊提供 Gemini 3 thought_signature 的提取和注入功能。
+// This section provides extraction and injection for Gemini 3 thought_signature.
+//
+// 背景 / Background:
+// - Gemini 3 模型在 function calling 時會返回 thought_signature
+// - 必須在下一次請求時將此 signature 傳回，否則會報 400 錯誤
+// - Gemini 3 models return thought_signature during function calling
+// - This signature MUST be passed back in next request, or 400 error occurs
+//
+// 處理流程 / Processing flow:
+// 1. 提取：從 SSE response chunk 中找到 thought_signature
+// 2. 存儲：保存在閉包狀態中（跨請求持久化）
+// 3. 注入：在下一次請求時注入到 message history 中
+//
+// 1. Extract: Find thought_signature from SSE response chunks
+// 2. Store: Save in closure state (persists across requests)
+// 3. Inject: Inject into message history in next request
+// ============================================================================
+
+/**
+ * 從 SSE chunk 的 choices 中提取 thought_signature
+ * Extract thought_signature from SSE chunk choices
+ *
+ * 用途：檢查多個可能的位置以提取 Gemini 3 的 thought_signature
+ * Purpose: Check multiple possible locations to extract Gemini 3's thought_signature
+ *
+ * 為什麼需要檢查多個位置？
+ * Why check multiple locations?
+ * - OpenAI-compatible API 的格式可能會變化
+ * - Gemini 可能將 signature 放在不同的嵌套層級
+ * - 通過檢查多個位置來確保兼容性
+ *
+ * - OpenAI-compatible API format may vary
+ * - Gemini might place signature at different nesting levels
+ * - Checking multiple locations ensures compatibility
+ *
+ * 檢查位置 / Check locations:
+ * 1. choices[i].delta.thought_signature (直接在 delta 層級)
+ * 2. choices[i].delta.tool_calls[0].extra_content.google.thought_signature (嵌套在 tool_calls 中)
+ *
+ * 1. choices[i].delta.thought_signature (direct at delta level)
+ * 2. choices[i].delta.tool_calls[0].extra_content.google.thought_signature (nested in tool_calls)
+ *
+ * 防禦性設計 / Defensive design:
+ * - 使用 safeGet() 安全訪問嵌套屬性
+ * - 驗證類型（必須是非空字符串）
+ * - 如果找不到則返回 undefined
+ *
+ * - Use safeGet() for safe nested property access
+ * - Validate type (must be non-empty string)
+ * - Return undefined if not found
+ *
+ * @param choices - SSE chunk 中的 choices 陣列 / Array of choice objects from SSE chunk
+ * @returns 找到的 thought_signature 字符串，或 undefined / thought_signature string if found, or undefined
+ *
+ * @example
+ * const choices = [{
+ *   delta: {
+ *     thought_signature: "encrypted_sig_123",
+ *     tool_calls: [...]
+ *   }
+ * }];
+ * const sig = extractThoughtSignature(choices);
+ * // sig === "encrypted_sig_123"
+ */
+function extractThoughtSignature(choices: unknown[]): string | undefined {
+  // 遍歷每個 choice（通常只有一個）
+  // Iterate through each choice (usually only one)
+  for (const choice of choices) {
+    if (!isPlainObject(choice)) continue;
+
+    // 獲取 delta 物件（SSE streaming 格式）
+    // Get delta object (SSE streaming format)
+    const delta = safeGet<Record<string, unknown>>(choice, ["delta"]);
+    if (!isPlainObject(delta)) continue;
+
+    // 位置 1：直接在 delta 下（最可能的位置）
+    // Location 1: Directly under delta (most likely location)
+    // 格式：choices[0].delta.thought_signature
+    const directSig = safeGet<string>(delta, ["thought_signature"]);
+    if (typeof directSig === "string" && directSig.length > 0) {
+      debugLog("[thought_signature] Found at delta.thought_signature");
+      return directSig;
+    }
+
+    // 位置 2：嵌套在 tool_calls[0] 中（備選位置）
+    // Location 2: Nested in tool_calls[0] (alternative location)
+    // 格式：choices[0].delta.tool_calls[0].extra_content.google.thought_signature
+    const toolCalls = safeGet<unknown[]>(delta, ["tool_calls"]);
+    if (isValidArray(toolCalls)) {
+      const firstCall = toolCalls[0];
+      if (isPlainObject(firstCall)) {
+        const nestedSig = safeGet<string>(firstCall, [
+          "extra_content",
+          "google",
+          "thought_signature",
+        ]);
+        if (typeof nestedSig === "string" && nestedSig.length > 0) {
+          debugLog("[thought_signature] Found at delta.tool_calls[0].extra_content.google");
+          return nestedSig;
+        }
+      }
+    }
+  }
+
+  // 沒有找到 thought_signature（這是正常的，如果不是 function calling 的話）
+  // No thought_signature found (this is normal if not function calling)
+  return undefined;
+}
+
+/**
+ * 將 thought_signature 注入到請求 body 的 messages 中
+ * Inject thought_signature into request body messages
+ *
+ * 用途：找到最後一個帶有 tool_calls 的 assistant message，並將 signature 注入其中
+ * Purpose: Find the last assistant message with tool_calls and inject signature into it
+ *
+ * 為什麼需要這樣做？
+ * Why is this needed?
+ * - Gemini 3 要求在對話歷史中包含之前的 thought_signature
+ * - Signature 必須附加在發起 function call 的 assistant message 上
+ * - 格式必須符合：tool_calls[0].extra_content.google.thought_signature
+ *
+ * - Gemini 3 requires previous thought_signature in conversation history
+ * - Signature must be attached to the assistant message that initiated function call
+ * - Format must comply with: tool_calls[0].extra_content.google.thought_signature
+ *
+ * 注入策略 / Injection strategy:
+ * 1. 解析請求 body 為 JSON
+ * 2. 找到 messages 陣列
+ * 3. 從後往前查找 role === "assistant" 且有 tool_calls 的 message
+ * 4. 在該 message 的第一個 tool_call 中創建 extra_content.google.thought_signature
+ *
+ * 1. Parse request body as JSON
+ * 2. Find messages array
+ * 3. Search backwards for message with role === "assistant" and tool_calls
+ * 4. Create extra_content.google.thought_signature in first tool_call of that message
+ *
+ * 防禦性設計 / Defensive design:
+ * - try-catch 保護整個函數
+ * - 如果注入失敗，返回原始 body（不會破壞請求）
+ * - 使用 safeGet() 安全訪問
+ * - 驗證每一步的類型
+ *
+ * - try-catch protects entire function
+ * - If injection fails, return original body (won't break request)
+ * - Use safeGet() for safe access
+ * - Validate type at each step
+ *
+ * @param body - 請求 body JSON 字符串 / Request body JSON string
+ * @param thoughtSignature - 要注入的 signature / Signature to inject
+ * @returns 修改後的 body，或原始 body（如果注入不可行）/ Modified body or original if injection not possible
+ *
+ * @example
+ * const body = JSON.stringify({
+ *   messages: [
+ *     { role: "user", content: "Check flight" },
+ *     { role: "assistant", tool_calls: [{ id: "1", function: {...} }] },
+ *     { role: "user", content: [...] } // function response
+ *   ]
+ * });
+ * const newBody = injectThoughtSignature(body, "sig_abc123");
+ * // Now tool_calls[0].extra_content.google.thought_signature === "sig_abc123"
+ */
+function injectThoughtSignature(body: string, thoughtSignature: string): string {
+  try {
+    // 解析請求 body
+    // Parse request body
+    const json = JSON.parse(body);
+
+    // 獲取 messages 陣列（對話歷史）
+    // Get messages array (conversation history)
+    const messages = safeGet<unknown[]>(json, ["messages"]);
+    if (!isArray(messages) || messages.length === 0) {
+      debugLog("[thought_signature] No messages array, skipping injection");
+      return body;
+    }
+
+    // 從後往前查找最後一個 assistant message with tool_calls
+    // Search backwards for last assistant message with tool_calls
+    // 為什麼從後往前？因為我們要找最近的一次 function call
+    // Why backwards? Because we want the most recent function call
+    let targetIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (!isPlainObject(msg)) continue;
+
+      const role = safeGet<string>(msg, ["role"]);
+      const toolCalls = safeGet<unknown[]>(msg, ["tool_calls"]);
+
+      // 找到了：role 是 "assistant" 且有 tool_calls
+      // Found it: role is "assistant" and has tool_calls
+      if (role === "assistant" && isValidArray(toolCalls)) {
+        targetIndex = i;
+        debugLog(`[thought_signature] Found target message at index ${i}`);
+        break;
+      }
+    }
+
+    // 沒找到合適的 message（這是正常的，如果當前請求不涉及 function calling）
+    // No suitable message found (normal if current request doesn't involve function calling)
+    if (targetIndex === -1) {
+      debugLog("[thought_signature] No assistant message with tool_calls found");
+      return body;
+    }
+
+    // 獲取目標 message 和其 tool_calls
+    // Get target message and its tool_calls
+    const message = messages[targetIndex] as Record<string, unknown>;
+    const toolCalls = message.tool_calls as Array<Record<string, unknown>>;
+
+    // 根據 Gemini 文檔，只需要在第一個 tool_call 中注入 signature
+    // According to Gemini docs, only need to inject signature in first tool_call
+    const firstCall = toolCalls[0];
+    if (!isPlainObject(firstCall)) {
+      debugLog("[thought_signature] First tool_call is not a plain object");
+      return body;
+    }
+
+    // 創建嵌套結構：extra_content.google.thought_signature
+    // Create nested structure: extra_content.google.thought_signature
+    // 注意：必須按照 Gemini 的格式要求來創建
+    // Note: Must create according to Gemini's format requirements
+
+    if (!firstCall.extra_content) {
+      firstCall.extra_content = {};
+    }
+    const extraContent = firstCall.extra_content as Record<string, unknown>;
+
+    if (!extraContent.google) {
+      extraContent.google = {};
+    }
+    const google = extraContent.google as Record<string, unknown>;
+
+    // 注入 thought_signature
+    // Inject thought_signature
+    google.thought_signature = thoughtSignature;
+
+    debugLog(`[thought_signature] Injected into message[${targetIndex}].tool_calls[0]`);
+
+    // 返回修改後的 JSON
+    // Return modified JSON
+    return JSON.stringify(json);
+  } catch (e) {
+    // 捕獲任何錯誤，返回原始 body
+    // Catch any errors, return original body
+    // 這確保即使注入失敗，也不會破壞請求
+    // This ensures that even if injection fails, request won't be broken
+    debugLog("[thought_signature] Failed to inject:", e);
+    return body;
+  }
 }
 
 // ============================================================================
@@ -779,7 +1120,8 @@ function ensureToolCallIndex(state: ChoiceIndexState, call: MutableToolCall): bo
  */
 function patchChunkPayload(
   payload: string,
-  state: StreamState
+  state: StreamState,
+  config: { handleThoughtSignature: boolean }
 ): { patched: string | null; shouldFilter: boolean } {
   try {
     const json = JSON.parse(payload);
@@ -799,6 +1141,15 @@ function patchChunkPayload(
     }
 
     debugLog("Processing chunk with", choices.length, "choices");
+
+    // 提取 Gemini 3 thought_signature（如果啟用）
+    if (config.handleThoughtSignature) {
+      const sig = extractThoughtSignature(choices);
+      if (sig) {
+        debugLog("[thought_signature] Extracted:", sig.slice(0, 30) + "...");
+        state.thoughtSignature = sig;
+      }
+    }
 
     // Check if this chunk should be filtered
     if (STREAM_PATCH_CONFIG.filterEmptyChunksAfterToolCalls && state.sawToolCallsFinish) {
@@ -933,7 +1284,11 @@ function patchToolCallIndices(choices: unknown[], state: StreamState): boolean {
  * Transform a single SSE event
  * Defensive: returns original if structure is unexpected
  */
-function transformEvent(event: string, state: StreamState): string | null {
+function transformEvent(
+  event: string,
+  state: StreamState,
+  config: { handleThoughtSignature: boolean }
+): string | null {
   if (!event.trim()) return event;
 
   state.chunkCount++;
@@ -955,7 +1310,7 @@ function transformEvent(event: string, state: StreamState): string | null {
 
   debugLog(`[Chunk ${state.chunkCount}] Payload:`, payload.slice(0, 500));
 
-  const result = patchChunkPayload(payload, state);
+  const result = patchChunkPayload(payload, state, config);
 
   // Filter out if needed
   if (result.shouldFilter) return null;
@@ -974,13 +1329,20 @@ function transformEvent(event: string, state: StreamState): string | null {
 /**
  * Patch an SSE stream
  * Defensive: handles stream errors gracefully
+ *
+ * Stores thought_signature in shared state for use in next request
  */
-function patchSseStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+function patchSseStream(
+  stream: ReadableStream<Uint8Array>,
+  sharedSignatureState: ThoughtSignatureState,
+  config: { handleThoughtSignature: boolean }
+): ReadableStream<Uint8Array> {
   const reader = stream.getReader();
   const state: StreamState = {
     toolCallState: new Map(),
     sawToolCallsFinish: false,
     chunkCount: 0,
+    thoughtSignature: undefined,
   };
   let buffer = "";
 
@@ -989,9 +1351,15 @@ function patchSseStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint
       try {
         const { value, done } = await reader.read();
         if (done) {
+          // Store thought_signature when stream completes
+          if (config.handleThoughtSignature && state.thoughtSignature) {
+            sharedSignatureState.value = state.thoughtSignature;
+            debugLog("[thought_signature] Stored for next request");
+          }
+
           // Flush remaining buffer
           if (buffer.trim().length > 0) {
-            const transformed = transformEvent(buffer, state);
+            const transformed = transformEvent(buffer, state, config);
             if (transformed !== null) {
               controller.enqueue(encoder.encode(`${transformed}\n\n`));
             }
@@ -1008,7 +1376,7 @@ function patchSseStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint
         while ((boundary = buffer.indexOf("\n\n")) !== -1) {
           const event = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
-          const transformed = transformEvent(event, state);
+          const transformed = transformEvent(event, state, config);
           if (transformed !== null) {
             controller.enqueue(encoder.encode(`${transformed}\n\n`));
           }
@@ -1050,6 +1418,7 @@ export function createToolCallIndexPatchedFetch(
   const {
     transformConstToEnum: shouldTransformTools = true,
     patchToolCallIndex: shouldPatchToolCalls = true,
+    handleThoughtSignature: shouldHandleThoughtSignature = false,
     additionalKeywordsToRemove = [],
     customKeywordTransforms = {},
   } = options ?? {};
@@ -1065,16 +1434,39 @@ export function createToolCallIndexPatchedFetch(
     ...customKeywordTransforms,
   };
 
+  /**
+   * Closure-level state for Gemini 3 thought_signature
+   * Persists across request/response cycles within this fetch instance
+   */
+  const thoughtSignatureState: ThoughtSignatureState = { value: undefined };
+
   const patchedFetch = async (input: FetchInput, init?: FetchInit) => {
     debugLog("=== Fetch Request ===");
     debugLog("URL:", typeof input === "string" ? input : input.toString());
 
     // Transform request body if needed
-    if (shouldTransformTools && init?.body && typeof init.body === "string") {
-      const transformedBody = transformRequestBody(init.body, {
-        keywordsToRemove,
-        keywordTransforms,
-      });
+    if (init?.body && typeof init.body === "string") {
+      let transformedBody = init.body;
+
+      // Apply JSON Schema transformations for provider compatibility
+      if (shouldTransformTools) {
+        transformedBody = transformRequestBody(transformedBody, {
+          keywordsToRemove,
+          keywordTransforms,
+        });
+      }
+
+      // Inject Gemini 3 thought_signature if available
+      if (shouldHandleThoughtSignature && thoughtSignatureState.value) {
+        debugLog("[thought_signature] Injecting into request");
+        transformedBody = injectThoughtSignature(
+          transformedBody,
+          thoughtSignatureState.value
+        );
+        // Keep signature for potential retries
+        // Only clear after successful response extraction
+      }
+
       init = { ...init, body: transformedBody };
     }
 
@@ -1085,9 +1477,9 @@ export function createToolCallIndexPatchedFetch(
     debugLog("Response status:", response.status);
     debugLog("Content-Type:", contentType);
 
-    // Skip patching if disabled
-    if (!shouldPatchToolCalls) {
-      debugLog("Tool-call patch disabled, passing through response");
+    // Skip patching if all patches are disabled
+    if (!shouldPatchToolCalls && !shouldHandleThoughtSignature) {
+      debugLog("All patches disabled, passing through response");
       return response;
     }
 
@@ -1099,7 +1491,11 @@ export function createToolCallIndexPatchedFetch(
 
     // Patch the stream
     debugLog("=== Patching SSE stream ===");
-    const patchedStream = patchSseStream(response.body);
+    const patchedStream = patchSseStream(
+      response.body,
+      thoughtSignatureState,
+      { handleThoughtSignature: shouldHandleThoughtSignature }
+    );
     const headers = new Headers(response.headers);
     return new Response(patchedStream, {
       status: response.status,

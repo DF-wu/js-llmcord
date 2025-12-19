@@ -84,6 +84,7 @@ export async function getProvidersFromConfig() {
           ? createToolCallIndexPatchedFetch(globalThis.fetch, {
               patchToolCallIndex: true,
               transformConstToEnum: true,
+              handleThoughtSignature: true,
             })
           : undefined;
 
