@@ -1,9 +1,9 @@
 # Discord settings:
 
-bot_token:
+bot_token: 
 client_id: "123456789"
-status_message:
-uploadthing_apikey:
+status_message: 
+uploadthing_apikey: 
 
 max_text: 100000
 max_images: 5
@@ -35,6 +35,7 @@ permissions:
     allowed_ids: []
     blocked_ids: []
 
+
 # LLM settings:
 additional_vision_models: []
 
@@ -42,33 +43,31 @@ providers:
   # Remote providers:
   azure-openai:
     base_url: https://<resource name>.openai.azure.com/openai/deployments/<deployment name>
-    api_key:
+    api_key: 
     extra_query:
       api-version: 2024-12-01-preview
   google:
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key:
-    compatibility:
-      patch_tool_call_index: true # enables Gemini tool schema conversion and tool_call index patching
+    api_key: 
   groq:
     base_url: https://api.groq.com/openai/v1
-    api_key:
+    api_key: 
   mistral:
     base_url: https://api.mistral.ai/v1
-    api_key:
+    api_key: 
   openai:
     base_url: https://api.openai.com/v1
-    api_key:
+    api_key: 
     api_schema: completion # or `responses`
   openrouter:
     base_url: https://openrouter.ai/api/v1
-    api_key:
+    api_key: 
   x-ai:
     base_url: https://api.x.ai/v1
-    api_key:
+    api_key: 
   ai-gateway:
-    base_url: https://ai-gateway.vercel.sh/v1/ai
-    api_key:
+    base_url: https://ai-gateway.vercel.sh/v3/ai
+    api_key: 
 
   # Local providers:
   lmstudio:
