@@ -932,7 +932,7 @@ function transformJsonSchema(
     // 例如：const: "value" → enum: ["value"]
     // Example: const: "value" → enum: ["value"]
     if (key in options.keywordTransforms) {
-      const transform = options.keywordTransforms[key];
+      const transform = options.keywordTransforms[key]!; // Non-null assertion: we checked with 'in' operator
       const transformed = transform(value);
       // 使用 Object.assign 將轉換結果合併到 result
       // Use Object.assign to merge transformation result into result

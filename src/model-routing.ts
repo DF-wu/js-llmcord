@@ -74,6 +74,9 @@ export async function getProvidersFromConfig() {
       : null,
     // Google is now handled as OpenAI-compatible provider below
     // This allows the tool call index patch to be applied when configured
+    // We set it to null here to satisfy the Providers type constraint
+    // It will be overridden by the spread below if configured
+    google: null,
     ...Object.fromEntries(
       openaiCompatibleProviders.map((p) => {
         const providerConfig = config.providers[p]!;
